@@ -1,0 +1,9 @@
+/vendor
+/.idea
+/.vscode
+/.archive
+/.git-*
+/py
+/python_bin
+__pycache__
+composer.lock
