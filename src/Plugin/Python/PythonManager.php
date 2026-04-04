@@ -368,7 +368,7 @@ class PythonManager
                 'name' => $rootPackage->getName(),
                 'version' => $rootPackage->getVersion(),
                 'properties' => $rootExtra[$this->package_name],
-                'is_root' => $rootPackage->getName() == '__root__',
+                'is_root' => true,
             ];
         }
 
