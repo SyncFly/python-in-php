@@ -3,7 +3,7 @@
 namespace Python_In_PHP\Plugin;
 
 use Composer\Command\BaseCommand;
-use Python_In_PHP\Plugin\Python\PythonManager1;
+use Python_In_PHP\Plugin\Python\PythonManager;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
@@ -37,7 +37,7 @@ class PipCommand extends BaseCommand
         }
         $outputService->debugMessage($action);
 
-        $python = new PythonManager1($vendorDir, $binDir, $this->requireComposer(), $outputService);
+        $python = new PythonManager($vendorDir, $binDir, $this->requireComposer(), $outputService);
         $python->runPipCommand($action);
 
         return 0;

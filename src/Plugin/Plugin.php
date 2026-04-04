@@ -9,7 +9,7 @@ use Composer\Plugin\Capable;
 use Composer\Plugin\PluginInterface;
 use Composer\Script\Event;
 use Composer\Script\ScriptEvents;
-use Python_In_PHP\Plugin\Python\PythonManager1;
+use Python_In_PHP\Plugin\Python\PythonManager;
 
 class Plugin implements PluginInterface, Capable, EventSubscriberInterface
 {
@@ -54,7 +54,7 @@ class Plugin implements PluginInterface, Capable, EventSubscriberInterface
 
         $outputService->newLine();
         $outputService->displayMessage("Python-In-PHP", 1);
-        $python = new PythonManager1($vendorDir, $binDir, $this->composer, $outputService);
+        $python = new PythonManager($vendorDir, $binDir, $this->composer, $outputService);
         $python->handleInstall();
     }
 }

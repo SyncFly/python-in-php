@@ -1,6 +1,6 @@
 {
     "name": "syncfly/python-in-php",
-    "description": "\"Python-In-PHP\" allows you to use any Python packages directly in PHP, as if they were native PHP classes. This PHP-Python bridge comes with built-in Pip package manager support, which is integrated directly into Composer",
+    "description": "\"Python-In-PHP\" allows you to use any Python packages directly in PHP, as if they were native PHP classes. This PHP-Python bridge comes with built-in package manager, which is integrated directly into Composer",
     "version": "0.8.1",
     "type": "composer-plugin",
     "license": "proprietary",
