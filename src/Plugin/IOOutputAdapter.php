@@ -20,14 +20,14 @@ class IOOutputAdapter implements OutputInterface
         $this->formatter = new OutputFormatter();
     }
 
-    public function write(iterable|string $messages, bool $newline = false, int $options = 0): void
+    public function write($messages, bool $newline = false, int $options = 0): void
     {
         foreach ((array)$messages as $message) {
             $this->io->write($message, $newline);
         }
     }
 
-    public function writeln(iterable|string $messages, int $options = 0): void
+    public function writeln($messages, int $options = 0): void
     {
         foreach ((array)$messages as $message) {
             $this->io->write($message);
