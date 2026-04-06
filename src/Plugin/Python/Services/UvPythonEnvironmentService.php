@@ -19,6 +19,7 @@ class UvPythonEnvironmentService
         private OutputService $output
     ){
         putenv('UV_PYTHON_INSTALL_DIR=' . $this->bin_dir . DIRECTORY_SEPARATOR . 'python');
+        putenv('UV_PYTHON_PREFERENCE=only-managed');
     }
 
     public function installUvIfMissing(): void
