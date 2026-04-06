@@ -17,7 +17,9 @@ class UvPythonEnvironmentService
         private string $dir,
         private string $bin_dir,
         private OutputService $output
-    ){}
+    ){
+        putenv('UV_PYTHON_INSTALL_DIR=' . $this->bin_dir . DIRECTORY_SEPARATOR . 'python');
+    }
 
     public function installUvIfMissing(): void
     {
@@ -81,6 +83,21 @@ class UvPythonEnvironmentService
         return true;
     }
 
+    public function restoreSymlinkIfMissing(string $python_version): void
+    {
+        $python_bin_path = $this->getPythonBinPath();
+        if (file_exists($python_bin_path)) return;
+
+        $env_path = $this->getEnvDir($python_version);
+        if (!is_dir($env_path)) return;
+
+        $bin_subdir = PHP_OS_FAMILY === 'Windows' ? 'Scripts' : 'bin';
+        $this->createSymlink(
+            dirname($python_bin_path),
+            $env_path . DIRECTORY_SEPARATOR . $bin_subdir
+        );
+    }
+
     public function getUvBinPath(): string
     {
         $ext = PHP_OS_FAMILY === 'Windows' ? '.exe' : '';
@@ -99,7 +116,7 @@ class UvPythonEnvironmentService
 
     public function getEnvDir(string $python_version): string
     {
-        return $this->bin_dir . DIRECTORY_SEPARATOR . 'uv_envs' . DIRECTORY_SEPARATOR . $python_version;
+        return $this->bin_dir . DIRECTORY_SEPARATOR . 'envs' . DIRECTORY_SEPARATOR . $python_version;
     }
 
     private function getUvDownloadLink(string $os, string $arch): string
@@ -142,7 +159,7 @@ class UvPythonEnvironmentService
         return $base . $fileName;
     }
 
-    private function createSymlink(string $link, string $target): void
+    protected function createSymlink(string $link, string $target): void
     {
         $linkParent = dirname($link);
         if (!is_dir($linkParent)) {
@@ -175,6 +192,6 @@ class UvPythonEnvironmentService
 
     public function deleteAllEnvironments(): void
     {
-        Utils::deleteFolder($this->bin_dir . DIRECTORY_SEPARATOR . 'uv_envs');
+        Utils::deleteFolder($this->bin_dir . DIRECTORY_SEPARATOR . 'envs');
     }
 }

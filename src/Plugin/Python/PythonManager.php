@@ -48,6 +48,9 @@ class PythonManager
         $this->python_environment = new UvPythonEnvironmentService($this->dir, $this->bin_dir, $this->output);
         $this->python_environment->installUvIfMissing();
         $this->is_new_environment = $this->python_environment->createEnvironmentIfMissing($this->project->getPythonVersion());
+        if (!$this->is_new_environment) {
+            $this->python_environment->restoreSymlinkIfMissing($this->project->getPythonVersion());
+        }
         $this->python_service = new UvService($this->python_environment, $this->output);
 
         $this->python_bin_path = $this->python_environment->getPythonBinPath();
@@ -98,7 +101,12 @@ class PythonManager
             }
         }
         $this->saveProject();
-        $this->php_docs->refreshPhpDocs($packages_to_refresh);
+
+        if (!empty($packages_to_refresh) || $this->is_new_environment) {
+            $this->php_docs->refreshPhpDocs($packages_to_refresh, $this->is_new_environment);
+        } elseif ($this->isPhpDocsMissing()) {
+            $this->refreshPhpDocsForAllPackages();
+        }
     }
 
     public function handleUninstall(array $command)
@@ -393,6 +401,14 @@ class PythonManager
     {
         $composer_json_path = dirname($this->composer->getConfig()->get('vendor-dir')) . '/composer.json';
         $this->project->saveInComposerJson($composer_json_path);
+    }
+
+    private function isPhpDocsMissing(): bool
+    {
+        $py_dir = $this->dir . DIRECTORY_SEPARATOR . 'py';
+        if (!is_dir($py_dir)) return true;
+        $entries = array_diff(scandir($py_dir), ['.', '..']);
+        return empty($entries);
     }
 
     private function refreshPhpDocsForAllPackages(): void
