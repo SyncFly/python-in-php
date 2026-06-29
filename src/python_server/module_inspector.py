@@ -55,7 +55,12 @@ def _inspect_single_module_worker(module_name: str) -> Tuple[str, Dict[str, Any]
     try:
         module = importlib.import_module(module_name); inspector = ModuleInspector(max_depth=0); inspection_data = inspector.analyze_module_content(module); submodule_names = []
         if hasattr(module, "__path__"):
-            for module_info in pkgutil.walk_packages(module.__path__, module.__name__ + "."):
+            # Without onerror, walk_packages re-raises any non-ImportError from a
+            # sub-package's import, which would discard this module's whole inspection.
+            # Swallow per-subpackage failures so one broken part doesn't cancel the module.
+            def _on_walk_error(failed_name: str) -> None:
+                sys.stderr.write(f"WARNING: skipping subpackage '{failed_name}': {sys.exc_info()[1]}\n")
+            for module_info in pkgutil.walk_packages(module.__path__, module.__name__ + ".", onerror=_on_walk_error):
                 if not _is_module_excluded(module_info.name): submodule_names.append(module_info.name)
         return module_name, inspection_data, submodule_names
     except SystemExit: return module_name, {"error": f"Module '{module_name}' triggered SystemExit."}, []
