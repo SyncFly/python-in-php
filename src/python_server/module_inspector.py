@@ -13,6 +13,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 from unittest.mock import MagicMock
 
+# Use "spawn" for our pools: the default "fork" would fork the asyncio worker that
+# imports us and deadlock on its inherited threads/locks (notably in CI).
+try:
+    _MP_CONTEXT = multiprocessing.get_context('spawn')
+except ValueError:
+    _MP_CONTEXT = multiprocessing.get_context()
+
 GUI_MODULES_TO_MOCK = [
     'tkinter.ttk', 'PyQt5.QtWidgets', 'idlelib.pyshell',
     'PyQt5.QtCore', 'PyQt5.QtGui', 'PySide2.QtWidgets',
@@ -52,7 +59,7 @@ def _inspect_single_module_worker(module_name: str) -> Tuple[str, Dict[str, Any]
                 if not _is_module_excluded(module_info.name): submodule_names.append(module_info.name)
         return module_name, inspection_data, submodule_names
     except SystemExit: return module_name, {"error": f"Module '{module_name}' triggered SystemExit."}, []
-    except Exception: return module_name, {"error": f"Failed to inspect module '{module_name}'", "details": traceback.format_exc()}, []
+    except Exception as e: return module_name, {"error": f"{type(e).__name__}: {e}", "details": traceback.format_exc()}, []
 
 def _run_isolated_inspection_session(module_name: str, max_depth: int, worker_timeout: int, session_timeout: int) -> Tuple[str, Optional[Dict[str, Any]]]:
     try:
@@ -69,7 +76,7 @@ class ModuleInspector:
         self.session_timeout = session_timeout # Timeout for the entire analysis session of a single root module
 
     def _inspect_core(self, root_modules: List[str]) -> Dict[str, Any]:
-        with ProcessPoolExecutor() as executor:
+        with ProcessPoolExecutor(mp_context=_MP_CONTEXT) as executor:
             flat_results = {}; submitted_modules = set(root_modules); parent_map = {name: None for name in root_modules}
             futures = {executor.submit(_inspect_single_module_worker, name): name for name in root_modules}
             while futures:
@@ -112,21 +119,28 @@ class ModuleInspector:
 
     def inspect_modules_parallel_isolated(self, module_names: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
         final_results = {}
-        with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+        with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count(), mp_context=_MP_CONTEXT) as executor:
             future_to_module = {
                 executor.submit(_run_isolated_inspection_session, name, self.max_depth, self.worker_timeout, self.session_timeout): name
                 for name in module_names
             }
-            for future in as_completed(future_to_module):
-                module_name = future_to_module[future]
-                try:
-                    _, result = future.result(timeout=self.session_timeout)
-                    final_results[module_name] = result
-                except TimeoutError:
-                    # This error will occur if the session freezes internally (during shutdown)
-                    final_results[module_name] = {"error": f"Session for '{module_name}' timed out and was terminated."}
-                except Exception as exc:
-                    final_results[module_name] = {"error": f"Top-level session manager for '{module_name}' crashed.", "details": str(exc)}
+            # as_completed() without a timeout blocks forever if a worker hangs; cap the batch.
+            batch_timeout = self.session_timeout * 2
+            try:
+                for future in as_completed(future_to_module, timeout=batch_timeout):
+                    module_name = future_to_module[future]
+                    try:
+                        _, result = future.result(timeout=self.session_timeout)
+                        final_results[module_name] = result
+                    except TimeoutError:
+                        final_results[module_name] = {"error": f"Session for '{module_name}' timed out and was terminated."}
+                    except Exception as exc:
+                        final_results[module_name] = {"error": f"Top-level session manager for '{module_name}' crashed.", "details": str(exc)}
+            except TimeoutError:
+                for future, module_name in future_to_module.items():
+                    if module_name not in final_results:
+                        future.cancel()
+                        final_results[module_name] = {"error": f"Inspection of '{module_name}' timed out (batch deadline reached)."}
         return final_results
 
     def analyze_module_content(self, module_obj: types.ModuleType) -> Dict[str, Any]:
@@ -151,11 +165,21 @@ class ModuleInspector:
                 args = [ModuleInspector.get_type_name(arg) for arg in type_hint.__args__]; return f"{origin_name}[{', '.join(args)}]"
             return origin_name
         return str(type_hint)
+    @staticmethod
+    def _param_name(name: str, kind) -> str:
+        # inspect.signature() drops the leading asterisks; re-add them so the PHP
+        # generator can render *args / **kwargs as variadics.
+        if kind == inspect.Parameter.VAR_POSITIONAL:
+            return '*' + name
+        if kind == inspect.Parameter.VAR_KEYWORD:
+            return '**' + name
+        return name
     def analyze_method_signature(self, method) -> Dict[str, Any]:
         try:
             sig = inspect.signature(method)
-            params = [{"name": name, "type": self.get_type_name(p.annotation) if p.annotation != p.empty else "Any", "default": repr(p.default) if p.default != p.empty else None} for name, p in sig.parameters.items()]
-            ret_type = self.get_type_name(sig.return_annotation) if sig.return_annotation != sig.empty else "None"
+            params = [{"name": self._param_name(name, p.kind), "type": self.get_type_name(p.annotation) if p.annotation != p.empty else "Any", "default": repr(p.default) if p.default != p.empty else None} for name, p in sig.parameters.items()]
+            # No annotation means unknown (=> mixed), not None; only explicit -> None is void.
+            ret_type = self.get_type_name(sig.return_annotation) if sig.return_annotation != sig.empty else "Any"
             return {"parameters": params, "return_type": ret_type}
         except Exception: return {"parameters": [], "return_type": None}
     def get_attribute_type(self, obj, attr_name: str) -> Optional[str]:

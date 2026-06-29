@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4"]
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: sockets
+          coverage: none
+
+      # uv binary, the uv-managed Python interpreter and the project venv all live
+      # under the fixture's bin-dir (vendor/bin/python-in-php). Cache the whole tree
+      # so first-run setup (uv download + Python download + package install) is reused.
+      - name: Cache uv and Python environment
+        uses: actions/cache@v4
+        with:
+          path: fixtures/project/vendor/bin/python-in-php
+          key: python-env-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fixtures/project/composer.json') }}-v1
+          restore-keys: |
+            python-env-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Run unit tests
+        run: ./vendor/bin/pest tests/Unit/ --no-coverage
+
+      - name: Run feature tests
+        run: ./vendor/bin/pest tests/Feature/ --no-coverage
+        timeout-minutes: 10

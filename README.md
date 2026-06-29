@@ -26,28 +26,171 @@ You can run AI models with libraries like `transformers`, `torch`, `vllm`, `nump
 </tr>
 </table>
 
-### Installation
+## System requirements
+
+| Requirement | Version |
+|-------------|---------|
+| PHP | ≥ 8.2 |
+| OS | Linux, macOS, Windows |
+| Architecture | x86_64, arm64 |
+
+The library automatically downloads and installs the [`uv`](https://docs.astral.sh/uv/) tool and a Python environment on first use. No manual Python installation is required.
+
+> **Note for Windows users:** symlink creation may require Administrator privileges or Developer Mode enabled.
+
+## Installation
+
 ```bash
 composer require syncfly/python-in-php
 ```
-You need to answer "yes" when prompted to activate the plugin.
 
-[//]: # (⭐️ Star the repository to show that it's in demand and ensure that it will be maintained for a long time.)
+Answer **yes** when Composer asks to activate the plugin. This will:
+1. Download `uv` (~10 MB) into `vendor/bin/`
+2. Create a Python virtual environment in `vendor/bin/python-in-php/`
+3. Generate PHPDoc stubs for installed packages in `py/`
 
-### Documentation
-You can find the documentation here: (coming soon)
+## Quick start
 
-### Package manager
-The `Python-in-PHP Package Manager` is a built-in package manager based on `uv` that allows you to install and manage Python packages.
-#### Intsall a package
-`composer pip install <package-name>`
-#### Uninstall a package
-`composer pip uninstall <package-name>`
-#### Upgrade a package
-`composer pip install --upgrade <package-name>`
+After installation, Python's standard library is available immediately:
 
-### Examples
-Look at an example of using `transformers` and `torch` in PHP for running an AI model:
+```php
+<?php
+
+use py\json;
+use py\datetime\datetime;
+
+echo json::dumps(['hello' => 'world']); // {"hello": "world"}
+echo datetime::now()->isoformat();       // 2024-01-15T12:34:56.789012
+```
+
+Install additional packages, then use them:
+
+```bash
+composer pip install numpy
+```
+
+```php
+<?php
+
+use py\numpy;
+
+$arr = numpy::array([1, 2, 3, 4, 5]);
+echo numpy::mean($arr); // 3.0
+```
+
+For a complete Python → PHP syntax reference (kwargs, iteration, dicts, context managers, exceptions, and more) see **[docs/usage.md](./docs/usage.md)**.
+
+## Package manager
+
+The built-in package manager wraps `uv pip` with Composer integration.
+
+```bash
+# Install a package
+composer pip install requests
+
+# Install a specific version
+composer pip install "numpy:^1.24"
+
+# Install with a custom PyPI index (e.g. PyTorch with ROCm)
+composer pip install torch --index-url https://download.pytorch.org/whl/rocm6.3
+
+# Install a local package from a directory
+composer pip install /path/to/my-local-package
+
+# Uninstall a package
+composer pip uninstall requests
+
+# Upgrade a package
+composer pip install --upgrade numpy
+```
+
+Installed packages and their sources are saved to `composer.json` under `extra.python-in-php.packages` and are re-installed automatically on the next `composer install`.
+
+## Configuration
+
+Configure Python-in-PHP in `composer.json`:
+
+```json
+{
+    "extra": {
+        "python-in-php": {
+            "python-version": "3.12",
+            "packages": [
+                {"name": "requests", "version": "*"},
+                {"name": "numpy",    "version": "^1.24"},
+                {
+                    "name":      "torch",
+                    "version":   "2.7.0+rocm6.3",
+                    "index-url": "https://download.pytorch.org/whl/rocm6.3"
+                },
+                {
+                    "name":    "my-local-lib",
+                    "version": "*",
+                    "path":    "/home/user/my-local-lib"
+                }
+            ]
+        }
+    }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `python-version` | string | `"3.12"` | Python version to install |
+| `packages` | array | `[]` | List of packages to install |
+| `packages[].name` | string | — | Package name |
+| `packages[].version` | string | `"*"` | Version constraint (PEP 440 or `*`) |
+| `packages[].index-url` | string | — | Custom PyPI index URL for this package |
+| `packages[].path` | string | — | Absolute path to a local package directory |
+
+## Using Python objects
+
+Python objects are returned as `PythonObject` instances that support method calls and attribute access:
+
+```php
+<?php
+
+use py\requests;
+
+$response = requests::get('https://httpbin.org/json');
+$data = $response->json();  // method call
+echo $response->status_code; // attribute access
+```
+
+### Context managers
+
+Use `PythonBridge::with()` to work with Python context managers:
+
+```php
+<?php
+
+use Python_In_PHP\PythonBridge;
+use py\open;
+
+$bridge = PythonBridge::startOrGetRunning();
+$file = $bridge->importModule('builtins');
+// ...
+```
+
+### Exceptions
+
+Python exceptions are thrown as `Python_In_PHP\PythonException`:
+
+```php
+<?php
+
+use Python_In_PHP\PythonException;
+use py\json;
+
+try {
+    json::loads('invalid json');
+} catch (PythonException $e) {
+    echo $e->getMessage();   // "Python error: Expecting value: line 1..."
+    echo $e->traceback;      // full Python traceback
+}
+```
+
+## AI model example
 
 ```php
 <?php
@@ -75,19 +218,17 @@ $input_ids = $tokenizer->apply_chat_template(
     add_generation_prompt: true
 );
 
-$outputs = $model->generate(
-    $input_ids,
-    max_new_tokens: 2048
-);
-
+$outputs = $model->generate($input_ids, max_new_tokens: 2048);
 $result = $tokenizer->decode($outputs[0], skip_special_tokens: true);
 ```
 
-Or simplier with `transformers pipeline`:
+Or simpler with `transformers pipeline`:
+
 ```php
 <?php
 
 use py\transformers;
+use py\torch;
 
 $pipe = transformers\pipeline(
     'text-generation',
@@ -96,17 +237,42 @@ $pipe = transformers\pipeline(
     device_map: 'auto'
 );
 
-$messages = [
-    ['role' => 'user', 'content' => 'Why PHP is great?']
-];
-
+$messages = [['role' => 'user', 'content' => 'Why PHP is great?']];
 $output = $pipe($messages, max_new_tokens: 2048);
-$generated = $output[0]['generated_text'];
-$result = end($generated)['content'];
+$result = end($output[0]['generated_text'])['content'];
 ```
 
-### License
+## Troubleshooting
+
+**`uv` download fails / no internet access**
+
+The library downloads `uv` automatically during `composer install`. If your environment has no internet access, install `uv` manually before running Composer:
+
+- macOS/Linux: `curl -Ls https://astral.sh/uv/install.sh | sh`
+- Windows: `winget install astral-sh.uv`
+
+Then set the `UV_BIN` env variable or ensure `uv` is in your `PATH`.
+
+**"Class py\xxx not found"**
+
+PHPDoc stubs are generated in `vendor/syncfly/python-in-php/py/`. Run `composer install` to regenerate them after adding new packages.
+
+**"Python script was not found"**
+
+The Python binary symlink is missing. Remove `vendor/bin/python-in-php/` and re-run `composer install`.
+
+**Python server does not start within 30 seconds**
+
+Check that the Python binary works: `vendor/bin/python-in-php/python --version`. If it fails, remove the environment and reinstall: `rm -rf vendor/bin/python-in-php && composer install`.
+
+**Permission denied on Windows**
+
+Symlink creation requires Administrator privileges or Windows Developer Mode. Run your terminal as Administrator, or enable Developer Mode in Windows Settings → System → Developer options.
+
+## License
+
 This project is distributed under a source-available license.
+
 #### Allowed:
 - Using the package in your projects, including commercial ones ✅
 - Making changes and submitting pull requests to this repository

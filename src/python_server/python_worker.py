@@ -23,24 +23,30 @@ from module_inspector import ModuleInspector
 # from numpy import integer as numpy_integer, floating as numpy_floating, bool_ as numpy_bool_
 import math
 
-libc = ctypes.CDLL("libc.so.6")
-PR_SET_PDEATHSIG = 1
-libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-
-if os.getppid() == 1:
-    raise SystemExit("Parent already dead")
-
-verbose = "--verbose" in sys.argv
-logging.basicConfig(
-    level=logging.INFO if verbose else logging.WARNING,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
 logger = logging.getLogger(__name__)
 
-try:
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-except Exception as e:
-    pass
+
+def _init_entrypoint_process() -> None:
+    """Entry-point-only setup.
+
+    Must not run when this module is re-imported as __mp_main__ by spawn pool
+    workers: re-applying PR_SET_PDEATHSIG / the getppid() check there kills the
+    inspection workers and breaks the pool.
+    """
+    # SIGKILL this server if its parent (the PHP process) dies, so it never orphans.
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+        if os.getppid() == 1:
+            raise SystemExit("Parent already dead")
+    except OSError:
+        pass
+
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except Exception:
+        pass
 
 class ObjectReference:
     """Class representing a reference to a Python object"""
@@ -96,7 +102,29 @@ class PythonBridgeServer:
 
         # Periodic memory cleanup
         self._last_cleanup = time.monotonic()
-        #self._last_cleanup = asyncio.get_event_loop().time()
+
+        # Command registry — maps command name to handler coroutine/callable
+        self._command_handlers: Dict[str, Callable] = {
+            'import':                       self.handle_import,
+            'call':                         self.handle_call,
+            'exec':                         self.handle_exec,
+            'eval':                         self.handle_eval,
+            'call_method':                  self.handle_call_method,
+            'call_object':                  self.handle_call_object,
+            'get_attribute':                self.handle_get_attribute,
+            'release_object':               self.handle_release_object,
+            'to_string':                    self.handle_to_string,
+            'is_generator':                 self.handle_is_generator,
+            'get_module_names_in_packages': self.handle_get_module_names_in_packages,
+            'inspect_modules':              self.handle_inspect_modules,
+            'get_methods_and_properties':   self.handle_get_methods_and_properties,
+            'context_enter':                self.handle_context_enter,
+            'context_exit':                 self.handle_context_exit,
+            'shutdown':      lambda _: self.handle_shutdown(),
+            'ping':         lambda _: {'error': None, 'result': 'pong'},
+            'list_modules': lambda _: {'error': None, 'result': list(self.modules.keys())},
+            'list_objects': lambda _: {'error': None, 'result': list(self.object_store.keys())},
+        }
 
     def signal_handler(self, signum, frame):
         """Signal handler for graceful shutdown"""
@@ -393,8 +421,10 @@ class PythonBridgeServer:
 
             # Primitive types
             if isinstance(obj, (int, float, str, bool, type(None))):
-                if isinstance(obj, float) and (math.isinf(obj) or math.isnan(obj)):
-                    return None  # TODO
+                if isinstance(obj, float) and math.isnan(obj):
+                    return {'__python_float__': 'NAN'}
+                if isinstance(obj, float) and math.isinf(obj):
+                    return {'__python_float__': 'INF' if obj > 0 else '-INF'}
                 return obj
 
             logger.info(f"Serializing: {type(obj).__name__}")
@@ -410,7 +440,12 @@ class PythonBridgeServer:
                 return [self.serialize_for_json(item) for item in obj]
 
             if isinstance(obj, dict):
-                return {str(key): self.serialize_for_json(value) for key, value in obj.items()}
+                serialized = {str(key): self.serialize_for_json(value) for key, value in obj.items()}
+                # Wrap when dict is ambiguous after JSON round-trip in PHP:
+                # empty dicts and integer-keyed dicts both look like PHP sequential arrays.
+                if not obj or any(isinstance(k, int) for k in obj.keys()):
+                    return {'__python_type__': 'dict', 'value': serialized}
+                return serialized
 
             # Complex objects → references
             if self.should_return_reference(obj):
@@ -459,6 +494,18 @@ class PythonBridgeServer:
                 if obj is None:
                     raise ValueError(f'Object with ID {obj_id} not found')
                 return obj
+            elif data.get('__python_type__') == 'dict':
+                # Reconstruct a Python dict from PHP PythonDict wrapper.
+                # Restore integer keys that were stringified by json_encode.
+                value = data.get('value', {})
+                result = {}
+                for k, v in value.items():
+                    resolved_v = self.resolve_object_references(v)
+                    try:
+                        result[int(k)] = resolved_v
+                    except (ValueError, TypeError):
+                        result[k] = resolved_v
+                return result
             else:
                 return {key: self.resolve_object_references(value) for key, value in data.items()}
         elif isinstance(data, list):
@@ -467,64 +514,25 @@ class PythonBridgeServer:
             return data
 
     async def process_command(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a command from PHP"""
-        command = data.get('command')
-        args = data.get('args', [])
+        """Process a command from PHP via the command registry."""
+        command    = data.get('command')
+        args       = data.get('args', [])
         command_id = data.get('id')
 
         logger.info(f"Processing command: {command} (ID: {command_id})")
 
-        try:
-            if command == 'import':
-                result = await self.handle_import(args)
-            elif command == 'call':
-                result = await self.handle_call(args)
-            elif command == 'exec':
-                result = await self.handle_exec(args)
-            elif command == 'eval':
-                result = await self.handle_eval(args)
-            elif command == 'call_method':
-                result = await self.handle_call_method(args)
-            elif command == 'call_object':
-                result = await self.handle_call_object(args)
-            elif command == 'get_attribute':
-                result = await self.handle_get_attribute(args)
-            elif command == 'release_object':
-                result = await self.handle_release_object(args)
-            elif command == 'to_string':
-                result = await self.handle_to_string(args)
-            elif command == 'is_generator':
-                result = await self.handle_is_generator(args)
-            elif command == 'get_module_names_in_packages':
-                result = await self.handle_get_module_names_in_packages(args)
-            elif command == 'inspect_modules':
-                result = await self.handle_inspect_modules(args)
-            elif command == 'get_methods_and_properties':
-                result = await self.handle_get_methods_and_properties(args)
-            elif command == 'shutdown':
-                result = await self.handle_shutdown()
-            elif command == 'ping':
-                result = {'error': None, 'result': 'pong'}
-            elif command == 'list_modules':
-                result = {'error': None, 'result': list(self.modules.keys())}
-            elif command == 'list_objects':
-                result = {'error': None, 'result': list(self.object_store.keys())}
-            else:
-                result = {
-                    'error': f'Unknown command: {command}',
-                    'result': None
-                }
+        handler = self._command_handlers.get(command)
+        if handler is None:
+            return {'error': f'Unknown command: {command}', 'result': None, 'id': command_id}
 
+        try:
+            ret = handler(args)
+            result = await ret if asyncio.iscoroutine(ret) else ret
             result['id'] = command_id
             return result
-
         except Exception as e:
             logger.error(f"Error executing command {command}: {e}")
-            return {
-                'error': f'Command execution failed: {str(e)}',
-                'result': None,
-                'id': command_id
-            }
+            return {'error': f'Command execution failed: {str(e)}', 'result': None, 'id': command_id}
 
     def safe_json(self, value):
         if isinstance(value, (bytes, bytearray)):
@@ -1119,6 +1127,31 @@ class PythonBridgeServer:
                 'result': None
             }
 
+    async def handle_context_enter(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Enter a Python context manager (__enter__)"""
+        obj_id = args.get('obj_id')
+        obj = self.get_object(obj_id)
+        if obj is None:
+            return {'error': f'Object {obj_id} not found', 'result': None}
+        try:
+            ctx_result = obj.__enter__()
+            self.context_managers[obj_id] = obj
+            return {'error': None, 'result': self.serialize_for_json(ctx_result)}
+        except Exception as e:
+            return {'error': str(e), 'traceback': traceback.format_exc(), 'result': None}
+
+    async def handle_context_exit(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Exit a Python context manager (__exit__)"""
+        obj_id = args.get('obj_id')
+        obj = self.context_managers.pop(obj_id, None) or self.get_object(obj_id)
+        if obj is None:
+            return {'error': f'Object {obj_id} not found', 'result': None}
+        try:
+            obj.__exit__(None, None, None)
+            return {'error': None, 'result': None}
+        except Exception as e:
+            return {'error': str(e), 'traceback': traceback.format_exc(), 'result': None}
+
     async def handle_shutdown(self) -> Dict[str, Any]:
         """Initiate server shutdown"""
         logger.info("Shutdown command received")
@@ -1152,7 +1185,7 @@ class PythonBridgeServer:
             self.server.close()
             await self.server.wait_closed()
 
-        logger.info("The server was successfully stopepd")
+        logger.info("The server was successfully stopped")
 
         # Clear object storage
         self.object_store.clear()
@@ -1199,6 +1232,14 @@ class PythonBridgeServer:
 
 def main():
     """Entry point"""
+    _init_entrypoint_process()
+
+    verbose = "--verbose" in sys.argv
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
     parser = argparse.ArgumentParser(description='Python Bridge WebSocket Server')
     parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
     parser.add_argument('--port', type=int, default=8765, help='Port to bind to')

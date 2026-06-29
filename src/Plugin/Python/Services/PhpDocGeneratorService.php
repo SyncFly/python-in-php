@@ -25,6 +25,8 @@ class PhpDocGeneratorService
         'antigravity'
     ];
 
+    private array $importErrors = [];
+
     function __construct(
         private string $dir,
         public OutputService $output
@@ -58,12 +60,17 @@ class PhpDocGeneratorService
 
         $this->output->displayMessage("Generating PHP Docs for installed packages ", false);
 
+        $this->importErrors = [];
         if ($delete_old_docs) $this->deleteForModules($modules);
         $structures = $this->bridge->inspectModules($modules);
         $php_docs = $this->generateForModules($structures);
         $this->writeFiles($php_docs);
 
         $this->output->displayMessage("- Finished ✅", true, false);
+
+        foreach ($this->importErrors as $module => $error) {
+            $this->output->displayMessage("  ⚠️  $module: $error");
+        }
     }
 
     public function refreshPhpDocsForAllModules(): void
@@ -106,11 +113,17 @@ class PhpDocGeneratorService
         }
     }
 
-    private function generateForModules(array $structures): \Generator
+    private function generateForModules(iterable $structures): \Generator
     {
         foreach ($structures as $module_name => $module_structure) {
             $this->output->verboseMessage("Generating docs for module $module_name");
             if ($this->isExcludedModule($module_name)) continue;
+
+            if (is_array($module_structure) && isset($module_structure['error'])) {
+                $this->importErrors[$module_name] = $module_structure['error'];
+                continue;
+            }
+
             try {
                 yield from $this->generateForModule($module_name, $module_structure);
             }
@@ -148,13 +161,33 @@ class PhpDocGeneratorService
 
         if (!empty($entity['functions'])) {
             foreach ($entity['functions'] as $function_name => $function) {
-                $php_class->addComment("@method static {$function['return_type']} $function_name()");
+                $returnType = $this->convertReturnType($function['return_type'] ?? '');
+                $params = $this->buildParamString($function['parameters'] ?? []);
+                $php_class->addComment("@method static {$returnType} {$function_name}({$params})");
             }
         }
 
         if (!empty($entity['instance_methods'])) {
             foreach ($entity['instance_methods'] as $method_name => $method) {
-                $php_class->addComment("@method {$method['return_type']} {$method_name}()");
+                $returnType = $this->convertReturnType($method['return_type'] ?? '');
+                $params = $this->buildParamString($method['parameters'] ?? []);
+                $php_class->addComment("@method {$returnType} {$method_name}({$params})");
+            }
+        }
+
+        if (!empty($entity['static_methods'])) {
+            foreach ($entity['static_methods'] as $method_name => $method) {
+                $returnType = $this->convertReturnType($method['return_type'] ?? '');
+                $params = $this->buildParamString($method['parameters'] ?? []);
+                $php_class->addComment("@method static {$returnType} {$method_name}({$params})");
+            }
+        }
+
+        if (!empty($entity['class_methods'])) {
+            foreach ($entity['class_methods'] as $method_name => $method) {
+                $returnType = $this->convertReturnType($method['return_type'] ?? '');
+                $params = $this->buildParamString($method['parameters'] ?? []);
+                $php_class->addComment("@method static {$returnType} {$method_name}({$params})");
             }
         }
 
@@ -200,22 +233,57 @@ class PhpDocGeneratorService
         }
     }
 
-    private function convertType($type)
+    private function convertType(string $type): string
     {
         $converts = [
-            'int' => 'int',
-            'str' => 'string',
-            'bool' => 'bool',
-            'list' => 'array',
-            'dict' => 'array',
-            'tuple' => 'array',
-            'NoneType' => 'null'
+            'int'      => 'int',
+            'str'      => 'string',
+            'bool'     => 'bool',
+            'float'    => 'float',
+            'bytes'    => 'string',
+            'list'     => 'array',
+            'dict'     => 'array',
+            'tuple'    => 'array',
+            'NoneType' => 'null',
+            'None'     => 'null',
+            'Any'      => 'mixed',
         ];
 
-        if (isset($converts[$type])) {
-            return $converts[$type];
+        return $converts[$type] ?? '';
+    }
+
+    private function convertReturnType(string $type): string
+    {
+        if ($type === 'None' || $type === 'NoneType') {
+            return 'void';
         }
-        else return "";
+
+        $converted = $this->convertType($type);
+
+        // For return types, keep unknown types as-is so IDEs can resolve class names.
+        return $converted !== '' ? $converted : $type;
+    }
+
+    private function buildParamString(array $params): string
+    {
+        $parts = [];
+        foreach ($params as $param) {
+            $name = $param['name'] ?? '';
+            if ($name === 'self' || $name === 'cls') {
+                continue;
+            }
+
+            // *args and **kwargs both become a variadic so callers can pass extra
+            // positional or named arguments (e.g. requests::get($url, timeout: 10)).
+            $isVariadic = str_starts_with($name, '*');
+            $varName = '$' . ltrim($name, '*');
+            $type = $this->convertType($param['type'] ?? '') ?: 'mixed';
+            $spread = $isVariadic ? '...' : '';
+            $default = (!$isVariadic && ($param['default'] ?? null) === 'None') ? ' = null' : '';
+
+            $parts[] = "{$type} {$spread}{$varName}{$default}";
+        }
+        return implode(', ', $parts);
     }
 
     private function removeExcludedModules(array $modules): array

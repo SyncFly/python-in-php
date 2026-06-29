@@ -39,6 +39,9 @@ class PipCommand extends BaseCommand
 
         $python = new PythonManager($vendorDir, $binDir, $this->requireComposer(), $outputService);
         $python->runPipCommand($action);
+        if ($action[0] == 'du') {
+            $python->dumpAutoload();
+        }
 
         return 0;
     }

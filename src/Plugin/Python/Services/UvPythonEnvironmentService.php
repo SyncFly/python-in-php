@@ -36,8 +36,23 @@ class UvPythonEnvironmentService
             mkdir($this->bin_dir, 0777, true);
         }
 
-        $this->output->displayMessage("Downloading uv...");
-        copy($url, $target);
+        $this->output->displayMessage("Downloading uv v{$this->uv_version}...");
+
+        set_error_handler(static fn() => true);
+        try {
+            $ok = copy($url, $target);
+        } finally {
+            restore_error_handler();
+        }
+
+        if (!$ok || !file_exists($target)) {
+            throw new \RuntimeException(
+                "Failed to download uv from $url.\n" .
+                "Install uv manually, then re-run composer install:\n" .
+                "  macOS/Linux: curl -Ls https://astral.sh/uv/install.sh | sh\n" .
+                "  Windows:     winget install astral-sh.uv"
+            );
+        }
 
         if ($os === 'Windows') {
             // uv provides .zip for Windows

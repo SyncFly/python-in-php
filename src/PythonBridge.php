@@ -4,6 +4,8 @@ namespace Python_In_PHP;
 
 use Exception;
 use WebSocket\Client;
+use Python_In_PHP\PythonDict;
+use Python_In_PHP\PythonException;
 
 /**
  * A bridge for working with Python
@@ -22,7 +24,6 @@ class PythonBridge
     private bool $isConnected = false;
     private mixed $process;
     private array $object_references = [];
-    private array $async_operations = [];
     private int $timeout;
     private array $pipes;
 
@@ -92,7 +93,14 @@ class PythonBridge
 
     function isStarted(): bool
     {
-        $fp = @fsockopen($this->host, $this->port, $errno, $errstr, 0.005);
+        // Suppress fsockopen "Connection refused" warnings without relying on @,
+        // which Pest/Collision still surfaces via its PhpWarningTriggered subscriber.
+        set_error_handler(static fn() => true);
+        try {
+            $fp = fsockopen($this->host, $this->port, $errno, $errstr, 0.005);
+        } finally {
+            restore_error_handler();
+        }
         if ($fp) {
             fclose($fp);
             return true;
@@ -256,6 +264,23 @@ class PythonBridge
             $this->object_references[$result['obj_id']] = $obj;
             return $obj;
         }
+        elseif (is_array($result) && isset($result['__python_type__'])) {
+            if ($result['__python_type__'] === 'dict') {
+                $processedData = [];
+                foreach ($result['value'] as $key => $value) {
+                    $processedData[$key] = $this->processResult($value);
+                }
+                return new PythonDict($processedData);
+            }
+        }
+        elseif (is_array($result) && isset($result['__python_float__'])) {
+            return match($result['__python_float__']) {
+                'NAN'  => NAN,
+                'INF'  => INF,
+                '-INF' => -INF,
+                default => $result,
+            };
+        }
         elseif (is_array($result)) {
             $processedArray = [];
             foreach ($result as $key => $value) {
@@ -267,66 +292,28 @@ class PythonBridge
         return $result;
     }
 
-    /**
-     * Execution of an asynchronous operation
-     */
-    public function async(callable $operation)
+    /** @throws \BadMethodCallException always — async is not yet implemented */
+    public function async(callable $operation): never
     {
-        $operationId = uniqid('async_');
-        $this->async_operations[$operationId] = [
-            'operation' => $operation,
-            'status' => 'pending',
-            'result' => null,
-            'error' => null
-        ];
-
-        return $operationId;
+        throw new \BadMethodCallException('Async operations are not yet implemented');
     }
 
-    /**
-     * Waiting for an asynchronous operation to complete
-     */
-    public function await($operationId, $timeout = null)
+    /** @throws \BadMethodCallException always — async is not yet implemented */
+    public function await($operationId, $timeout = null): never
     {
-        if (!isset($this->async_operations[$operationId])) {
-            throw new Exception("Operation $operationId not found");
-        }
-
-        $timeout = $timeout ?? $this->timeout;
-        $startTime = microtime(true);
-
-        while ($this->async_operations[$operationId]['status'] === 'pending') {
-            if (microtime(true) - $startTime > $timeout) {
-                throw new Exception("Operation $operationId timed out after {$timeout} seconds");
-            }
-            usleep(100000); // 100ms
-        }
-
-        if ($this->async_operations[$operationId]['error']) {
-            throw new Exception($this->async_operations[$operationId]['error']);
-        }
-
-        return $this->async_operations[$operationId]['result'];
+        throw new \BadMethodCallException('Async operations are not yet implemented');
     }
 
-    /**
-     * Executing an asynchronous Python function call
-     */
-    public function asyncCall($function, $args = [], $kwargs = [])
+    /** @throws \BadMethodCallException always — async is not yet implemented */
+    public function asyncCall($function, $args = [], $kwargs = []): never
     {
-        return $this->async(function() use ($function, $args, $kwargs) {
-            return $this->call($function, $args, $kwargs);
-        });
+        throw new \BadMethodCallException('Async operations are not yet implemented');
     }
 
-    /**
-     * Performing an asynchronous call to a Python object method
-     */
-    public function asyncCallMethod($objId, $method, $args = [], $kwargs = [])
+    /** @throws \BadMethodCallException always — async is not yet implemented */
+    public function asyncCallMethod($objId, $method, $args = [], $kwargs = []): never
     {
-        return $this->async(function() use ($objId, $method, $args, $kwargs) {
-            return $this->callMethod($objId, $method, $args, $kwargs);
-        });
+        throw new \BadMethodCallException('Async operations are not yet implemented');
     }
 
     /**
@@ -358,48 +345,19 @@ class PythonBridge
         }
     }
 
-    /**
-     * Asynchronous work with Python's context manager
-     */
-    public function asyncWith($objId, callable $callback)
+    /** @throws \BadMethodCallException always — async is not yet implemented */
+    public function asyncWith($objId, callable $callback): never
     {
-        return $this->async(function() use ($objId, $callback) {
-            return $this->with($objId, $callback);
-        });
+        throw new \BadMethodCallException('Async operations are not yet implemented');
     }
 
     /**
-     * Get information about an object method
+     * Execute a command on the Python server.
+     *
+     * @throws PythonException   when Python raises an exception
+     * @throws \RuntimeException when the connection is lost and cannot be re-established
      */
-    public function getMethodInfo($objId, $method)
-    {
-        $objRef = $this->object_references[$objId] ?? null;
-        if (!$objRef) {
-            throw new Exception("Object $objId not found");
-        }
-
-        foreach ($objRef->methods as $methodInfo) {
-            if ($methodInfo['name'] === $method) {
-                return $methodInfo;
-            }
-        }
-
-        throw new Exception("Method $method not found in object $objId");
-    }
-
-    /**
-     * Check whether a method is asynchronous
-     */
-    public function isAsyncMethod($objId, $method)
-    {
-        $methodInfo = $this->getMethodInfo($objId, $method);
-        return $methodInfo['is_async'] ?? false;
-    }
-
-    /**
-     * Execute a command with support for asynchronous operations
-     */
-    public function execute($command, $args = [], $module = null)
+    public function execute(string $command, array $args = [], ?string $module = null): mixed
     {
         if (!$this->isConnected) {
             $this->connectToServer();
@@ -414,22 +372,42 @@ class PythonBridge
 
         $this->log("Sending command: $payload");
 
-        $this->client->send($payload);
-
-        $response = $this->client->receive();
+        try {
+            $this->client->send($payload);
+            $response = $this->client->receive();
+        } catch (\Exception $e) {
+            // Connection dropped — try once to reconnect and replay the request.
+            $this->log("Connection lost ({$e->getMessage()}), attempting reconnect…");
+            $this->isConnected = false;
+            $this->client = null;
+            try {
+                $this->connectToServer();
+                $this->client->send($payload);
+                $response = $this->client->receive();
+            } catch (\Exception $reconnectEx) {
+                throw new \RuntimeException(
+                    "Python server connection lost and reconnect failed: " . $reconnectEx->getMessage(),
+                    0,
+                    $reconnectEx
+                );
+            }
+        }
 
         $this->log("Response received: " . substr($response, 0, 2000));
 
         $result = json_decode($response, true, 10000);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception("JSON parsing error: " . json_last_error_msg());
+            throw new \RuntimeException("JSON parsing error: " . json_last_error_msg());
         }
 
         if (isset($result['error']) && $result['error']) {
-            if (!empty($result['traceback'])) print_r($result['traceback']);
-            if (!empty($result['data'])) print_r($result['data']);
-            throw new Exception("Python error: " . $result['error']);
+            $traceback = $result['traceback'] ?? '';
+            $message = "Python error: " . $result['error'];
+            if ($traceback) {
+                $message .= "\n\nTraceback:\n" . $traceback;
+            }
+            throw new PythonException($message, traceback: $traceback);
         }
 
         // Process the result to create object references
@@ -438,39 +416,19 @@ class PythonBridge
         return $processedResult;
     }
 
-    /**
-     * Process arguments for passing to Python
-     */
-    private function processArguments($args)
+    private function serializeArg(mixed $arg): mixed
     {
-        if (is_array($args)) {
-            return array_map(function($arg) {
-                if ($arg instanceof PythonObject) {
-                    return $arg->toArray();
-                }
-                return $arg;
-            }, $args);
-        }
-        return $args;
+        return $arg instanceof PythonObject ? $arg->toArray() : $arg;
     }
 
-    /**
-     * Process kwargs for passing to Python
-     */
-    private function processKwargs($kwargs)
+    private function processArguments(array $args): array
     {
-        if (is_array($kwargs)) {
-            $result = [];
-            foreach ($kwargs as $key => $value) {
-                if ($value instanceof PythonObject) {
-                    $result[$key] = $value->toArray();
-                } else {
-                    $result[$key] = $value;
-                }
-            }
-            return $result;
-        }
-        return $kwargs;
+        return array_map($this->serializeArg(...), $args);
+    }
+
+    private function processKwargs(array $kwargs): array
+    {
+        return array_map($this->serializeArg(...), $kwargs);
     }
 
     public function call($function, $args = [], $kwargs = [])

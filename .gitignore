@@ -5,5 +5,7 @@
 /.git-*
 /py
 /python_bin
-__pycache__
+/fixtures/project/vendor/
 composer.lock
+__pycache__
+.phpunit.result.cache

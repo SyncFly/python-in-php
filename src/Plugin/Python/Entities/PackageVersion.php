@@ -13,25 +13,22 @@ class PackageVersion
         $this->version = $version;
     }
 
-    // ===== Composer → Conda =====
-    function convertToConda(): string
+    private function convertConstraints(string $constraint, callable $convertSingle): string
     {
-        $constraint = trim($this->version);
+        $constraint = trim($constraint);
 
-        // Conda does not support OR (||)
         if (strpos($constraint, '||') !== false) {
             throw new InvalidArgumentException("Python packages does not support OR constraints (||): $constraint");
         }
 
-        // Split by space (AND)
         $tokens = preg_split('/\s+/', $constraint);
-        $converted = [];
+        return implode(",", array_map($convertSingle, $tokens));
+    }
 
-        foreach ($tokens as $token) {
-            $converted[] = $this->convertSingleConda($token);
-        }
-
-        return implode(",", $converted);
+    // ===== Composer → Conda =====
+    function convertToConda(): string
+    {
+        return $this->convertConstraints($this->version, $this->convertSingleConda(...));
     }
 
     private function convertSingleConda(string $version): string
@@ -101,22 +98,7 @@ class PackageVersion
     // ===== Composer → Pip =====
     function convertToPip(): string
     {
-        $constraint = trim($this->version);
-
-        // Pip does not support OR (||)
-        if (strpos($constraint, '||') !== false) {
-            throw new InvalidArgumentException("Python packages does not support OR constraints (||): $constraint");
-        }
-
-        // Split by space (AND)
-        $tokens = preg_split('/\s+/', $constraint);
-        $converted = [];
-
-        foreach ($tokens as $token) {
-            $converted[] = $this->convertSinglePip($token);
-        }
-
-        return implode(",", $converted);
+        return $this->convertConstraints($this->version, $this->convertSinglePip(...));
     }
 
     private function convertSinglePip(string $version): string {
@@ -174,6 +156,11 @@ class PackageVersion
 
         // Exact version
         if (preg_match('/^\d+(?:\.\d+){0,2}$/', $version)) {
+            return "==$version";
+        }
+
+        // PEP 440 local version identifier (e.g. 2.7.0+rocm6.3, 2.0.0+cu118)
+        if (preg_match('/^\d+(?:\.\d+)*(?:\+[a-zA-Z0-9._]+)+$/', $version)) {
             return "==$version";
         }
 

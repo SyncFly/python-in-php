@@ -4,6 +4,12 @@ use py\json;
 use py\sys;
 use py\datetime\datetime;
 
+beforeEach(function () {
+    if (!canOpenLocalTcpSocket()) {
+        $this->markTestSkipped('Local TCP sockets are not available in this environment');
+    }
+});
+
 test('static method call', function () {
     expect(json::dumps(['a' => 'b']))->toBe('{"a": "b"}');
 });

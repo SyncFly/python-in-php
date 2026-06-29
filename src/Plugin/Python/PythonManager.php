@@ -79,27 +79,79 @@ class PythonManager
 
     public function handleInstall(array $command = ['install'])
     {
-        if (!in_array('--no-deps', $command)){
+        $command_index_url = $this->extractOptionValue($command, '--index-url');
+        $command_path      = $this->extractPathFromCommand($command);
+        $has_custom_source = $command_index_url !== null || $command_path !== null;
+
+        if (!$has_custom_source && !in_array('--no-deps', $command)) {
+            // Standard flow: append stored packages that have no custom source to the main
+            // command so they all get reinstalled in a single uv invocation.
             foreach ($this->project->getPackages() as $package) {
-                if (!$this->commandIncludesPackage($command, $package)){
-                    if (in_array('--upgrade', $command)) $command[] = $package->name;
-                    else $command[] = $package->name . $package->version->convertToPip();
+                if (!$this->commandIncludesPackage($command, $package)
+                    && $package->index_url === null && $package->path === null) {
+                    $command[] = in_array('--upgrade', $command)
+                        ? $package->name
+                        : $package->getInstallSpec();
                 }
             }
         }
+        // When the user command already carries --index-url or a local path we intentionally
+        // do NOT append other stored packages: mixing them into the same uv invocation would
+        // route all of them through the custom index, breaking packages that live on PyPI.
 
         $result = $this->python_service->executePipCommand($this->project, $command);
 
         $this->output->displayMessage($result['output']);
 
-        $packages_to_refresh = [];
-        $packages = $this->parseAddedPackages($result['output']);
-        foreach ($packages as $package) {
-            if ($this->project->isAdded($package) || $this->commandIncludesPackage($command, $package) || in_array('--no-deps', $command) || $this->commandIncludes($command, '/')) {
-                $this->project->addPackage($package);
-                $packages_to_refresh[] = $package;
+        // Packages with custom sources (index_url / path) are always installed one-by-one so
+        // that each uv call can carry the right --index-url for that package.
+        $custom_refreshed = [];
+        if (!$has_custom_source && !in_array('--no-deps', $command)) {
+            foreach ($this->project->getPackages() as $package) {
+                if (!$this->commandIncludesPackage($command, $package)
+                    && ($package->index_url !== null || $package->path !== null)) {
+                    $is_successful = $this->installPackage($package);
+                    if ($is_successful) {
+                        $custom_refreshed[] = $package;
+                    } else {
+                        $this->project->removePackage($package);
+                    }
+                }
             }
         }
+
+        // Parse the main-command output and persist newly installed packages.
+        $packages_to_refresh = $custom_refreshed;
+        $existing_packages   = $this->project->getPackages();
+
+        foreach ($this->parseAddedPackages($result['output']) as $package) {
+            $should_save = $this->project->isAdded($package)
+                || $this->commandIncludesPackage($command, $package)
+                || in_array('--no-deps', $command)
+                || $has_custom_source;
+
+            if (!$should_save) {
+                continue;
+            }
+
+            // Preserve index_url / path for packages that are already tracked.
+            if (isset($existing_packages[$package->name])) {
+                $existing        = $existing_packages[$package->name];
+                $package->index_url = $existing->index_url;
+                $package->path      = $existing->path;
+            } elseif ($this->commandIncludesPackage($command, $package)) {
+                // Brand-new package: associate it with the source used in this command.
+                if ($command_index_url !== null) {
+                    $package->index_url = $command_index_url;
+                } elseif ($command_path !== null) {
+                    $package->path = $command_path;
+                }
+            }
+
+            $this->project->addPackage($package);
+            $packages_to_refresh[] = $package;
+        }
+
         $this->saveProject();
 
         if (!empty($packages_to_refresh) || $this->is_new_environment) {
@@ -129,6 +181,62 @@ class PythonManager
         $this->output->displayMessage($result['output']);
     }
 
+    /**
+     * Extract the value of a named flag from a command array.
+     * Handles both "--flag value" and "--flag=value" forms.
+     */
+    private function extractOptionValue(array $command, string $option): ?string
+    {
+        foreach ($command as $i => $part) {
+            if ($part === $option && isset($command[$i + 1])) {
+                return $command[$i + 1];
+            }
+            if (str_starts_with($part, $option . '=')) {
+                return substr($part, strlen($option) + 1);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Return the first local filesystem path found among the command arguments,
+     * resolved to an absolute path, or null if the command contains no path args.
+     */
+    private function extractPathFromCommand(array $command): ?string
+    {
+        // These flags consume the next token (their value), so we skip that token.
+        $flags_with_value = ['--index-url', '-i', '--extra-index-url', '--find-links', '-f', '--trusted-host'];
+        $skip_next = false;
+
+        foreach ($command as $part) {
+            if ($skip_next) {
+                $skip_next = false;
+                continue;
+            }
+            if (in_array($part, $flags_with_value)) {
+                $skip_next = true;
+                continue;
+            }
+            if (str_starts_with($part, '-')) {
+                continue;
+            }
+            if (in_array($part, ['install', 'uninstall', 'list', 'show', 'tree', 'check'])) {
+                continue;
+            }
+
+            // Looks like a local path
+            if (str_starts_with($part, '/')
+                || str_starts_with($part, './')
+                || str_starts_with($part, '../')
+                || (PHP_OS_FAMILY === 'Windows' && preg_match('/^[A-Za-z]:[\/\\\\]/', $part))
+            ) {
+                return realpath($part) ?: $part;
+            }
+        }
+
+        return null;
+    }
+
     public function commandIncludesPackage(array $command, Package $package): bool
     {
         $name = preg_quote($package->name, '/');
@@ -149,28 +257,20 @@ class PythonManager
         return false;
     }
 
+    private function parsePackagesFromOutput(string $output, string $sign): array
+    {
+        preg_match_all('/^\s*' . preg_quote($sign, '/') . '\s+(.+)==(.+)$/m', $output, $matches, PREG_SET_ORDER);
+        return array_map(fn($m) => new Package(trim($m[1]), new PackageVersion(trim($m[2]))), $matches);
+    }
+
     public function parseAddedPackages(string $output): array
     {
-        preg_match_all('/^\s*\+\s+(.+)==(.+)$/m', $output, $matches, PREG_SET_ORDER);
-
-        $packages = [];
-        foreach ($matches as $m) {
-            $packages[] = new Package(trim($m[1]), new PackageVersion(trim($m[2])));
-        }
-
-        return $packages;
+        return $this->parsePackagesFromOutput($output, '+');
     }
 
     public function parseRemovedPackages(string $output): array
     {
-        preg_match_all('/^\s*-\s+(.+)==(.+)$/m', $output, $matches, PREG_SET_ORDER);
-
-        $packages = [];
-        foreach ($matches as $m) {
-            $packages[] = new Package(trim($m[1]), new PackageVersion(trim($m[2])));
-        }
-
-        return $packages;
+        return $this->parsePackagesFromOutput($output, '-');
     }
 
     private function walkAndParsePackagesArguments(iterable $packages): array

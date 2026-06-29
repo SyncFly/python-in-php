@@ -1,0 +1,36 @@
+{
+    "name": "test/python-in-php-project",
+    "description": "Test fixture: consumer project with python-in-php installed",
+    "require": {
+        "syncfly/python-in-php": "*"
+    },
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../..",
+            "options": {
+                "symlink": true
+            }
+        }
+    ],
+    "extra": {
+        "python-in-php": {
+            "python-version": "3.12",
+            "packages": [
+                {
+                    "name": "requests",
+                    "version": "2.34.2"
+                },
+                {
+                    "name": "numpy",
+                    "version": "2.4.6"
+                }
+            ]
+        }
+    },
+    "config": {
+        "allow-plugins": {
+            "syncfly/python-in-php": true
+        }
+    }
+}

@@ -43,7 +43,26 @@ expect()->extend('toBeOne', function () {
 |
 */
 
-function something()
+function canOpenLocalTcpSocket(): bool
 {
-    // ..
+    static $canOpen = null;
+
+    if ($canOpen !== null) {
+        return $canOpen;
+    }
+
+    set_error_handler(static fn() => true);
+    try {
+        $socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
+        if ($socket === false) {
+            return $canOpen = false;
+        }
+
+        $canOpen = socket_bind($socket, '127.0.0.1', 0);
+        socket_close($socket);
+
+        return $canOpen;
+    } finally {
+        restore_error_handler();
+    }
 }

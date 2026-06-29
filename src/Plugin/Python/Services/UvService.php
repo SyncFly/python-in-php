@@ -18,11 +18,17 @@ class UvService
 
     public function installPackage(Package $package, Project $project): array
     {
-        $package_spec = $package->name . $package->version->convertToPip();
-        $result = $this->executeUvCommand($project, 'pip', ['install', $package_spec]);
-        
+        $args = ['install', $package->getInstallSpec()];
+
+        if ($package->index_url !== null) {
+            $args[] = '--index-url';
+            $args[] = $package->index_url;
+        }
+
+        $result = $this->executeUvCommand($project, 'pip', $args);
+
         $is_successful = $result['code'] === 0;
-        return [$is_successful, $is_successful ? "Installed $package_spec" : "Failed to install: " . $result['output']];
+        return [$is_successful, $is_successful ? "Installed {$package->name}" : "Failed to install: " . $result['output']];
     }
 
     public function uninstallPackage(Package $package, Project $project): bool
@@ -33,12 +39,18 @@ class UvService
 
     public function updatePackage(Package $package, Project $project): array
     {
-        $package_spec = $package->name . $package->version->convertToPip();
-        $result = $this->executeUvCommand($project, 'pip', ['install', '--upgrade', $package_spec]);
-        
+        $args = ['install', '--upgrade', $package->getInstallSpec()];
+
+        if ($package->index_url !== null) {
+            $args[] = '--index-url';
+            $args[] = $package->index_url;
+        }
+
+        $result = $this->executeUvCommand($project, 'pip', $args);
+
         $is_successful = $result['code'] === 0;
         $is_performed = !str_contains($result['output'], 'already satisfied');
-        
+
         return [$is_successful, $is_performed, $is_successful ? "Updated $package->name" : "Update failed"];
     }
 
@@ -49,10 +61,10 @@ class UvService
         $python_bin = $this->python_environment->getPythonBinPath();
         $python_bin = realpath($python_bin);
         $arguments_string = implode(' ', array_map('escapeshellarg', $arguments));
-        
+
         $cmd = escapeshellarg($python_bin) . " " . $arguments_string;
         $result = $this->runCommand($cmd);
-        
+
         return $result['output'];
     }
 

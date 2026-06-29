@@ -23,7 +23,6 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
     private $arrayCache = [];
     private $isGenerator = false;
     private $parentObject = null;
-    private $iterator = null;
 
     function __construct(PythonBridge $bridge, array $ref)
     {
@@ -39,7 +38,7 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
     /**
      * Magic method for calling object methods
      */
-    function __call($name, $arguments)
+    function __call(string $name, array $arguments): mixed
     {
         [$args, $kwargs] = $this->classifyArguments($arguments);
 
@@ -54,7 +53,7 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
     /**
      * Magic method for getting object properties
      */
-    function __get($name)
+    function __get(string $name): mixed
     {
         if (!isset($this->attributes[$name])) {
             try {
@@ -122,7 +121,7 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
      * @param $arguments
      * @return array
      */
-    public function classifyArguments($arguments): array
+    public function classifyArguments(array $arguments): array
     {
         $args = [];
         $kwargs = [];
@@ -201,11 +200,7 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
      */
     public function getIterator(): Traversable
     {
-        if ($this->iterator === null) {
-            return new \ArrayIterator($this->bridge->call('list', [$this]));
-        }
-
-        return $this->iterator;
+        return new \ArrayIterator($this->bridge->call('list', [$this]));
     }
 
     /**
