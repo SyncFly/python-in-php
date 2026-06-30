@@ -824,13 +824,26 @@ class PythonBridgeServer:
                     for package in packages:
                         try:
                             dist = importlib.metadata.distribution(package)
-
-                            for f in dist.files:
-                                top = str(f).split("/")[0]  # top-level directory
-                                if not top.endswith(".dist-info") and not top.startswith("__") and top.isidentifier():
-                                    result.add(top)
                         except Exception:
-                            pass
+                            continue
+
+                        # dist.files can be None (e.g. no RECORD); guard the iteration.
+                        for f in (dist.files or []):
+                            top = str(f).split("/")[0]  # top-level directory
+                            if not top.endswith(".dist-info") and not top.startswith("__") and top.isidentifier():
+                                result.add(top)
+
+                        # Fallback for editable (PEP 660) installs: their RECORD lists
+                        # only the __editable__*.pth redirect + dist-info, not the real
+                        # package files, so derive import names from top_level.txt.
+                        try:
+                            top_level = dist.read_text("top_level.txt")
+                        except Exception:
+                            top_level = None
+                        if top_level:
+                            for name in top_level.split():
+                                if name.isidentifier():
+                                    result.add(name)
 
                     return {
                         'error': None,
