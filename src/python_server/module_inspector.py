@@ -1,4 +1,6 @@
+import os
 import sys
+import time
 import types
 import inspect
 import pkgutil
@@ -10,7 +12,7 @@ import json
 import re
 import warnings
 from typing import Any, Dict, List, Optional, Set, Tuple
-from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError
 from unittest.mock import MagicMock
 
 # Use "spawn" for our pools: the default "fork" would fork the asyncio worker that
@@ -19,6 +21,36 @@ try:
     _MP_CONTEXT = multiprocessing.get_context('spawn')
 except ValueError:
     _MP_CONTEXT = multiprocessing.get_context()
+
+
+def _available_memory_gb() -> Optional[float]:
+    # Best-effort free memory, so we don't OOM a weak box by importing a heavy stack
+    # (torch et al.) in many workers at once. Prefers MemAvailable, which already
+    # accounts for RAM the surrounding app is holding. Returns None if unknown
+    # (e.g. Windows), in which case only the CPU cap applies.
+    try:
+        with open('/proc/meminfo') as f:
+            info = {}
+            for line in f:
+                key, _, rest = line.partition(':')
+                info[key.strip()] = rest.strip()
+        for key in ('MemAvailable', 'MemTotal'):
+            if key in info:
+                return int(info[key].split()[0]) / (1024 * 1024)
+    except Exception:
+        pass
+    try:
+        return (os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_AVPHYS_PAGES')) / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def _default_max_workers(cpu_cap: int = 8, mem_per_worker_gb: float = 1.5) -> int:
+    workers = min(multiprocessing.cpu_count(), cpu_cap)
+    avail = _available_memory_gb()
+    if avail is not None:
+        workers = min(workers, int(avail // mem_per_worker_gb))
+    return max(1, workers)
 
 GUI_MODULES_TO_MOCK = [
     'tkinter.ttk', 'PyQt5.QtWidgets', 'idlelib.pyshell',
@@ -66,49 +98,71 @@ def _inspect_single_module_worker(module_name: str) -> Tuple[str, Dict[str, Any]
     except SystemExit: return module_name, {"error": f"Module '{module_name}' triggered SystemExit."}, []
     except Exception as e: return module_name, {"error": f"{type(e).__name__}: {e}", "details": traceback.format_exc()}, []
 
-def _run_isolated_inspection_session(module_name: str, max_depth: int, worker_timeout: int, session_timeout: int) -> Tuple[str, Optional[Dict[str, Any]]]:
+def _run_isolated_inspection_session(module_name: str, max_depth: int, worker_timeout: int, session_timeout: int, max_workers: int) -> Tuple[str, Optional[Dict[str, Any]]]:
     try:
-        inspector = ModuleInspector(max_depth=max_depth, worker_timeout=worker_timeout, session_timeout=session_timeout)
+        inspector = ModuleInspector(max_depth=max_depth, worker_timeout=worker_timeout, session_timeout=session_timeout, max_workers=max_workers)
         result = inspector.inspect_module(module_name)
         return module_name, result
     except Exception as e:
         return module_name, {"error": f"Isolated session for '{module_name}' crashed unexpectedly.", "details": str(e)}
 
 class ModuleInspector:
-    def __init__(self, max_depth: int = 3, worker_timeout: int = 60, session_timeout: int = 300):
+    def __init__(self, max_depth: int = 3, worker_timeout: int = 180, session_timeout: int = 1200, max_workers: Optional[int] = None):
         self.max_depth = max_depth
+        # worker_timeout is a *no-progress* timeout: we abort only if nothing at all
+        # completes for this long. A slow-but-progressing (weak) machine keeps going;
+        # only a genuinely hung import trips it.
         self.worker_timeout = worker_timeout
-        self.session_timeout = session_timeout # Timeout for the entire analysis session of a single root module
+        # Absolute ceiling for analysing a single root module, so a huge package can't
+        # run forever even while making steady progress.
+        self.session_timeout = session_timeout
+        # Cap the inner pool by both CPU and free RAM so a single root module can't
+        # spawn cpu_count workers (or, with the outer pool, cpu_count**2 processes),
+        # each re-importing a heavy stack and OOM-ing a weak machine.
+        self.max_workers = max_workers or _default_max_workers()
 
     def _inspect_core(self, root_modules: List[str]) -> Dict[str, Any]:
-        with ProcessPoolExecutor(mp_context=_MP_CONTEXT) as executor:
+        session_deadline = time.monotonic() + self.session_timeout
+        with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=_MP_CONTEXT) as executor:
             flat_results = {}; submitted_modules = set(root_modules); parent_map = {name: None for name in root_modules}
             futures = {executor.submit(_inspect_single_module_worker, name): name for name in root_modules}
             while futures:
-                try:
-                    for future in as_completed(futures, timeout=self.worker_timeout):
-                        parent_module_name = futures.pop(future)
-                        try:
-                            _, inspection_data, discovered_submodules = future.result()
-                            flat_results[parent_module_name] = inspection_data
-                            root_name = next(r for r in root_modules if parent_module_name.startswith(r))
-                            current_depth = parent_module_name.count('.') - root_name.count('.')
-                            if current_depth < self.max_depth:
-                                for sub_name in discovered_submodules:
-                                    if sub_name not in submitted_modules:
-                                        submitted_modules.add(sub_name); parent_map[sub_name] = parent_module_name
-                                        new_future = executor.submit(_inspect_single_module_worker, sub_name)
-                                        futures[new_future] = sub_name
-                        except Exception as exc:
-                            flat_results[parent_module_name] = {"error": f"Future result retrieval failed: {exc}"}
-                except TimeoutError:
-                    stuck_modules = list(futures.values())
-                    sys.stderr.write(f"\nWARNING: Worker timeout reached in batch. Stuck modules: {stuck_modules}\n")
+                # Stop if the whole-session budget is exhausted, regardless of progress.
+                budget_left = session_deadline - time.monotonic()
+                if budget_left <= 0:
                     for future, name in futures.items():
                         future.cancel()
                         if name not in flat_results:
-                            flat_results[name] = {"error": "Analysis timed out (worker crashed)."}
+                            flat_results[name] = {"error": f"Analysis exceeded session budget of {self.session_timeout}s."}
                     break
+
+                # Wait for *any* worker to finish. worker_timeout here is a no-progress
+                # window: a slow machine that keeps completing modules never trips it.
+                done, _ = wait(list(futures), timeout=min(self.worker_timeout, budget_left), return_when=FIRST_COMPLETED)
+                if not done:
+                    stuck_modules = list(futures.values())
+                    sys.stderr.write(f"\nWARNING: no inspection progress for {self.worker_timeout}s. Stuck modules: {stuck_modules}\n")
+                    for future, name in futures.items():
+                        future.cancel()
+                        if name not in flat_results:
+                            flat_results[name] = {"error": f"Analysis stalled (no progress for {self.worker_timeout}s)."}
+                    break
+
+                for future in done:
+                    parent_module_name = futures.pop(future)
+                    try:
+                        _, inspection_data, discovered_submodules = future.result()
+                        flat_results[parent_module_name] = inspection_data
+                        root_name = next(r for r in root_modules if parent_module_name.startswith(r))
+                        current_depth = parent_module_name.count('.') - root_name.count('.')
+                        if current_depth < self.max_depth:
+                            for sub_name in discovered_submodules:
+                                if sub_name not in submitted_modules:
+                                    submitted_modules.add(sub_name); parent_map[sub_name] = parent_module_name
+                                    new_future = executor.submit(_inspect_single_module_worker, sub_name)
+                                    futures[new_future] = sub_name
+                    except Exception as exc:
+                        flat_results[parent_module_name] = {"error": f"Future result retrieval failed: {exc}"}
         if not flat_results: return {}
         for res in flat_results.values():
             if "error" not in res: res["submodules"] = {}
@@ -124,9 +178,15 @@ class ModuleInspector:
 
     def inspect_modules_parallel_isolated(self, module_names: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
         final_results = {}
-        with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count(), mp_context=_MP_CONTEXT) as executor:
+        # self.max_workers is the *total* concurrent heavy-import budget. Split it
+        # between the outer pool (one process per root module) and each root's inner
+        # submodule pool so the product stays within budget and a weak machine isn't
+        # swamped by cpu_count**2 processes each importing torch.
+        outer_workers = max(1, min(self.max_workers, len(module_names)))
+        per_session_workers = max(1, self.max_workers // outer_workers)
+        with ProcessPoolExecutor(max_workers=outer_workers, mp_context=_MP_CONTEXT) as executor:
             future_to_module = {
-                executor.submit(_run_isolated_inspection_session, name, self.max_depth, self.worker_timeout, self.session_timeout): name
+                executor.submit(_run_isolated_inspection_session, name, self.max_depth, self.worker_timeout, self.session_timeout, per_session_workers): name
                 for name in module_names
             }
             # as_completed() without a timeout blocks forever if a worker hangs; cap the batch.
@@ -135,7 +195,9 @@ class ModuleInspector:
                 for future in as_completed(future_to_module, timeout=batch_timeout):
                     module_name = future_to_module[future]
                     try:
-                        _, result = future.result(timeout=self.session_timeout)
+                        # Small buffer over session_timeout so the inner run can hit its
+                        # own budget and return partial results before we give up on it.
+                        _, result = future.result(timeout=self.session_timeout + 30)
                         final_results[module_name] = result
                     except TimeoutError:
                         final_results[module_name] = {"error": f"Session for '{module_name}' timed out and was terminated."}

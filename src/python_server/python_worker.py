@@ -876,7 +876,14 @@ class PythonBridgeServer:
 
             # Execute
             try:
-                inspector = ModuleInspector()
+                # Timeouts/pool size are tunable per call so heavy ML packages can be
+                # given a larger budget without editing the inspector defaults.
+                inspector_kwargs = {
+                    key: args[key]
+                    for key in ('max_depth', 'worker_timeout', 'session_timeout', 'max_workers')
+                    if args.get(key) is not None
+                }
+                inspector = ModuleInspector(**inspector_kwargs)
                 result = inspector.inspect_modules_parallel_isolated(modules)
 
                 return {
