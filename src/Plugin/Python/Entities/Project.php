@@ -14,12 +14,12 @@ class Project
 
     public function addPackage(Package $package): void
     {
-        $this->packages[$package->name] = $package;
+        $this->packages[$package->getKey()] = $package;
     }
 
     public function removePackage(Package $package): void
     {
-        unset($this->packages[$package->name]);
+        unset($this->packages[$package->getKey()]);
     }
 
     /**
@@ -93,6 +93,6 @@ class Project
 
     public function isAdded(Package $package): bool
     {
-        return isset($this->packages[$package->name]);
+        return isset($this->packages[$package->getKey()]);
     }
 }

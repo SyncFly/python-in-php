@@ -1,17 +1,24 @@
+
+> ⏳ The project is currently under active development. It is still in the beta stage, but it is already working.
+> <br/>⭐️ Star the repository to support the project and follow us
+
 <table>
 <tr>
 <td valign="top">
-
-> ⏳ The project is currently under active development. It is still in the alpha stage, but it is already working.
-> <br/>⭐️ Star the repository to support the project and follow us
 
 #### Python-in-PHP
 
 The **Python-in-PHP** library allows you to easily use any Python packages as if they were native PHP packages 🐘
 
-🔥 Fully use artificial intelligence frameworks for AI models inference or training directly in PHP! 
+🔥 Fully use artificial intelligence frameworks for AI models inference or training directly in PHP!
 <br/>
 You can run AI models with libraries like `transformers`, `torch`, `vllm`, `numpy`, etc. in your PHP project with PHP syntax.
+</td>
+<td style="max-width: 30%" valign="center">
+<img src="image.png" alt="Python-in-PHP" width="200"/>
+</td>
+</tr>
+</table>
 
 ✅ Environment with Python is installed automatically with Composer.
 
@@ -19,12 +26,6 @@ You can run AI models with libraries like `transformers`, `torch`, `vllm`, `nump
 
 ✅ Automatic PHPDoc generation for code completion in IDEs for any Python packages.
 
-</td>
-<td width="200" valign="center">
-<img src="image.png" alt="Python-in-PHP" width="200"/>
-</td>
-</tr>
-</table>
 
 ## System requirements
 
@@ -171,6 +172,54 @@ $bridge = PythonBridge::startOrGetRunning();
 $file = $bridge->importModule('builtins');
 // ...
 ```
+
+### PHP callbacks in Python
+
+You can pass a PHP callable as an argument to any Python call. Python receives a
+callable it can invoke synchronously — the PHP callback runs and its return value
+is sent back — so functions like `map`, `filter`, `sorted(key=...)` and any API
+that takes a callback work directly:
+
+```php
+<?php
+
+use py\builtins;
+
+// A PHP closure invoked by Python's map()
+$doubled = builtins::list(builtins::map(fn ($x) => $x * 2, [1, 2, 3]));
+// [2, 4, 6]
+
+// As a sorting key
+$sorted = builtins::sorted(['ccc', 'a', 'bb'], key: fn ($w) => strlen($w));
+// ['a', 'bb', 'ccc']
+```
+
+The callback may itself call back into Python (re-entrancy), and it can be stored
+by Python and invoked later:
+
+```php
+<?php
+
+use py\functools;
+
+$adder = functools::partial(fn ($a, $b) => $a + $b, 10);
+echo $adder(5); // 15 — the PHP callback runs each time Python calls the partial
+```
+
+Most PHP callables are auto-detected as callbacks: a `Closure`, a first-class
+callable (`strlen(...)`), a `[$object, 'method']` pair, an invokable object, etc.
+
+> ℹ️ **Callable strings are not auto-detected.** A plain string such as
+> `'strlen'` is ambiguous with ordinary string data, so it is passed to Python as
+> a string. To use a named function (or force callback semantics for any value),
+> wrap it in `Py::callback()`:
+>
+> ```php
+> $lengths = builtins::map(Py::callback('strlen'), ['a', 'bb', 'ccc']);
+> ```
+
+If an exception is thrown inside the PHP callback, it propagates back to the
+original caller.
 
 ### Exceptions
 

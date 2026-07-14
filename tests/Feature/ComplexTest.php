@@ -25,11 +25,8 @@ test('using Python HTTP-client', function () {
 test('using numpy', function () {
     $temps = numpy::array([12.5, 14.1, 13.8, 15.2, 16.0]);
 
-    expect(numpy::mean($temps))
-        ->toBeApproximately(14.32, 0.05);
-
-    expect(numpy::std($temps))
-        ->toBeApproximately(1.17, 0.05);
+    expect(numpy::mean($temps))->toBeApproximately(14.32, 0.05)
+        ->and(numpy::std($temps))->toBeApproximately(1.17, 0.05);
 
     $mask = numpy::greater($temps, numpy::mean($temps));
     $aboveAvg = numpy::where($mask);

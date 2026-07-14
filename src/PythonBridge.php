@@ -22,8 +22,10 @@ class PythonBridge
 
     private ?Client $client = null;
     private bool $isConnected = false;
-    private mixed $process;
+    private mixed $process = null;
     private array $object_references = [];
+    /** @var array<string, callable> PHP callables exposed to Python, keyed by callback id */
+    private array $php_callbacks = [];
     private int $timeout;
     private array $pipes;
 
@@ -132,21 +134,42 @@ class PythonBridge
             throw new Exception("⚠️ Python script was not found: {$this->python_script}");
         }
 
-        $verbose = $this->debug ? '--verbose 1' : '';
-
-        $cmd = "{$this->python_binary} \"$scriptPath\" --host {$this->host} --port {$this->port} $verbose";
-
-        $this->log("Starting the Python server: $cmd");
-
-        if (PHP_OS_FAMILY === 'Windows') {
-            $redirect = $this->debug ? '' : '>nul 2>&1';
-            $command = 'cmd /C "cd /D "' . $this->working_directory . '" && ' . $cmd . ' ' . $redirect . '"';
-            $this->process = $process = proc_open($command, [], $pipes);
+        // Build the command as an argument array (not a string). A string command
+        // makes proc_open spawn it through a shell (`/bin/sh -c` / `cmd /C`), so the
+        // handle in $this->process wraps the *shell*, not Python: proc_get_status()
+        // then reports the shell's PID, and stop()'s posix_kill()/taskkill by that PID
+        // never reaches the Python grandchild — it survives as an orphan and does not
+        // die with the launching PHP process. The array form runs Python directly, so
+        // $this->process is the Python process itself and stop() can actually kill it.
+        // We pass the working directory via proc_open's $cwd argument instead of a
+        // shell `cd`.
+        $args = [$this->python_binary, $scriptPath, '--host', $this->host, '--port', (string) $this->port];
+        if ($this->debug) {
+            $args[] = '--verbose';
+            $args[] = '1';
         }
-        else {
-            $redirect = $this->debug ? '' : '> /dev/null 2>&1';
-            $command = "cd \"{$this->working_directory}\" && {$cmd} $redirect";
-            $this->process = $process = proc_open($command, [], $pipes);
+
+        $this->log("Starting the Python server: " . implode(' ', $args));
+
+        // Detach the worker's stdio from our own descriptors. With an empty
+        // descriptorspec proc_open lets the child inherit our stdin/stdout/stderr;
+        // because the worker is a long-lived daemon it would then hold those fds open
+        // forever. That is fatal when a parent reads our stdout to EOF (e.g. the test
+        // bootstrap runs `composer install` via passthru()): composer finishes but the
+        // inherited pipe never closes, so passthru() — and the whole test run — hangs.
+        // Routing the child's stdio to the null device breaks that inheritance.
+        $null = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
+        $descriptors = $this->debug
+            ? [] // keep inheriting so the worker's logs are visible while debugging
+            : [
+                0 => ['file', $null, 'r'],
+                1 => ['file', $null, 'w'],
+                2 => ['file', $null, 'w'],
+            ];
+
+        $this->process = $process = proc_open($args, $descriptors, $pipes, $this->working_directory);
+        if (!is_resource($this->process)) {
+            throw new Exception("❌ Failed to start the Python server process");
         }
 
         $this->pipes = $pipes;
@@ -175,6 +198,20 @@ class PythonBridge
         }
 
         $this->log("✅ The Python server was started successfully");
+    }
+
+    /**
+     * PID of the spawned Python worker process, or null if no worker is running.
+     * Because the worker is now launched without a shell wrapper, this is the PID of
+     * the Python process itself — the one stop() signals on shutdown.
+     */
+    public function getWorkerPid(): ?int
+    {
+        if (!is_resource($this->process)) {
+            return null;
+        }
+        $status = proc_get_status($this->process);
+        return $status['running'] ? $status['pid'] : null;
     }
 
     private function getFreePort(): int {
@@ -231,9 +268,9 @@ class PythonBridge
                 exec("taskkill /F /T /PID {$pid}");
             }
             else {
-                // Send SIGTERM to the shell process by its exact PID.
-                // Using -$pid (process group) would fail because proc_open does
-                // not create a new process group, so the PGID never equals $pid.
+                // $pid is the Python process itself (spawned via the array form of
+                // proc_open, without a shell wrapper), so signalling it directly is
+                // enough — no process group is involved.
                 posix_kill($pid, SIGTERM);
 
                 $deadline = microtime(true) + 3;
@@ -377,6 +414,7 @@ class PythonBridge
             $response = $this->client->receive();
         } catch (\Exception $e) {
             // Connection dropped — try once to reconnect and replay the request.
+            // Only the initial send/receive is retried; a drop mid callback exchange propagates.
             $this->log("Connection lost ({$e->getMessage()}), attempting reconnect…");
             $this->isConnected = false;
             $this->client = null;
@@ -393,32 +431,124 @@ class PythonBridge
             }
         }
 
-        $this->log("Response received: " . substr($response, 0, 2000));
+        // Re-entrant loop: the worker may interleave callback invoke/release frames
+        // before the actual response — service them until the response arrives.
+        while (true) {
+            $this->log("Frame received: " . substr($response, 0, 2000));
 
-        $result = json_decode($response, true, 10000);
+            $frame = json_decode($response, true, 10000);
 
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new \RuntimeException("JSON parsing error: " . json_last_error_msg());
-        }
-
-        if (isset($result['error']) && $result['error']) {
-            $traceback = $result['traceback'] ?? '';
-            $message = "Python error: " . $result['error'];
-            if ($traceback) {
-                $message .= "\n\nTraceback:\n" . $traceback;
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                throw new \RuntimeException("JSON parsing error: " . json_last_error_msg());
             }
-            throw new PythonException($message, traceback: $traceback);
+
+            $frameCommand = $frame['command'] ?? null;
+
+            if ($frameCommand === 'invoke_php_callback') {
+                $this->runPhpCallback($frame);
+                $response = $this->client->receive();
+                continue;
+            }
+
+            if ($frameCommand === 'release_php_callback') {
+                unset($this->php_callbacks[$frame['callback_id'] ?? '']);
+                $response = $this->client->receive();
+                continue;
+            }
+
+            // Terminal response for our command.
+            if (isset($frame['error']) && $frame['error']) {
+                $traceback = $frame['traceback'] ?? '';
+                $message = "Python error: " . $frame['error'];
+                if ($traceback) {
+                    $message .= "\n\nTraceback:\n" . $traceback;
+                }
+                throw new PythonException($message, traceback: $traceback);
+            }
+
+            // Process the result to create object references
+            return $this->processResult($frame['result'] ?? null);
         }
-
-        // Process the result to create object references
-        $processedResult = $this->processResult($result['result'] ?? null);
-
-        return $processedResult;
     }
 
+    /**
+     * Run the PHP callable named by an "invoke_php_callback" frame and send its
+     * result (or error) back. The callable may re-enter Python via a nested Py:: call.
+     */
+    private function runPhpCallback(array $frame): void
+    {
+        $callbackId = $frame['callback_id'] ?? null;
+        $frameId = $frame['id'] ?? null;
+        $this->log("Invoking PHP callback {$callbackId}");
+
+        try {
+            if ($callbackId === null || !isset($this->php_callbacks[$callbackId])) {
+                throw new \RuntimeException("PHP callback {$callbackId} is not registered");
+            }
+            $callable = $this->php_callbacks[$callbackId];
+
+            // Resolve incoming arguments (Python object refs -> PythonObject, etc.)
+            $args = $this->processResult($frame['args'] ?? []);
+            $kwargs = $this->processResult($frame['kwargs'] ?? []);
+            $args = is_array($args) ? array_values($args) : [];
+            $kwargs = is_array($kwargs) ? $kwargs : [];
+
+            // String-keyed kwargs are spread as PHP named arguments (PHP 8.1+).
+            $ret = $callable(...$args, ...$kwargs);
+
+            $reply = json_encode([
+                'callback_result' => $this->serializeArg($ret),
+                'error' => null,
+                'id' => $frameId,
+            ]);
+        } catch (\Throwable $e) {
+            $reply = json_encode([
+                'callback_result' => null,
+                'error' => $e->getMessage(),
+                'traceback' => $e->getTraceAsString(),
+                'id' => $frameId,
+            ]);
+        }
+
+        $this->client->send($reply);
+    }
+
+    /**
+     * Register a PHP callable so Python can invoke it, and return its id.
+     */
+    private function registerCallback(callable $callable): string
+    {
+        $id = bin2hex(random_bytes(8));
+        $this->php_callbacks[$id] = $callable;
+        return $id;
+    }
+
+    /**
+     * Serialize a single argument for the wire. PHP callables become a
+     * __php_callable__ marker Python turns into a callable proxy; arrays are
+     * walked so nested callables are caught too.
+     */
     private function serializeArg(mixed $arg): mixed
     {
-        return $arg instanceof PythonObject ? $arg->toArray() : $arg;
+        if ($arg instanceof PythonObject) {
+            return $arg->toArray();
+        }
+
+        if ($arg instanceof PhpCallback) {
+            return ['__php_callable__' => true, 'callback_id' => $this->registerCallback($arg->getCallable())];
+        }
+
+        // Bare strings are excluded: a function-name string is indistinguishable
+        // from data, so it stays data unless wrapped in Py::callback().
+        if (!is_string($arg) && is_callable($arg)) {
+            return ['__php_callable__' => true, 'callback_id' => $this->registerCallback($arg)];
+        }
+
+        if (is_array($arg)) {
+            return array_map($this->serializeArg(...), $arg);
+        }
+
+        return $arg;
     }
 
     private function processArguments(array $args): array
@@ -564,7 +694,18 @@ class PythonBridge
     private function disconnect()
     {
         if ($this->client) {
-            $this->client->close();
+            // Only perform the WebSocket closing handshake while the worker is still
+            // alive. close() reads/writes the socket to exchange close frames; against
+            // a worker that has already stopped/crashed that just emits warnings (and
+            // then throws) for nothing — we're discarding the connection anyway. The
+            // try/catch stays as a safety net for the worker dying mid-handshake.
+            if ($this->getWorkerPid() !== null) {
+                try {
+                    $this->client->close();
+                } catch (\Throwable $e) {
+                    $this->log("Ignoring error while closing WebSocket connection: {$e->getMessage()}");
+                }
+            }
             $this->client = null;
             $this->isConnected = false;
             $this->log("WebSocket connection closed");

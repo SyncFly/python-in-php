@@ -15,6 +15,10 @@ use Python_In_PHP\Plugin\Python\Entities\Package;
 
 class PhpDocGeneratorService
 {
+    // Modules inspected per round-trip. Large enough to keep the Python-side worker
+    // pool saturated, small enough that the progress counter advances visibly.
+    private const PROGRESS_CHUNK_SIZE = 12;
+
     private ?PythonBridge $bridge;
     private PythonObject $sys;
     private PythonObject $pkgutil;
@@ -58,15 +62,28 @@ class PhpDocGeneratorService
 
         if (empty($modules)) return;
 
-        $this->output->displayMessage("Generating PHP Docs for installed packages ", false);
+        // Terminate this line with a newline so it flushes to the console *before* the
+        // long blocking inspection below. Without the newline the message sits in an
+        // unterminated line and only appears (glued to "Finished") once generation ends,
+        // which looks like a silent hang on a non-TTY (e.g. captured by the test runner).
+        $this->output->displayMessage("Generating PHP Docs for installed packages...", 1);
 
         $this->importErrors = [];
         if ($delete_old_docs) $this->deleteForModules($modules);
-        $structures = $this->bridge->inspectModules($modules);
-        $php_docs = $this->generateForModules($structures);
-        $this->writeFiles($php_docs);
 
-        $this->output->displayMessage("- Finished ✅", true, false);
+        // Inspect + generate in chunks rather than one giant blocking call, so we can
+        // report progress. Inspection (the Python round-trip) is where the time goes;
+        // chunking is the only way to surface a moving counter during that wait.
+        $total = count($modules);
+        $done = 0;
+        foreach (array_chunk($modules, self::PROGRESS_CHUNK_SIZE) as $chunk) {
+            $structures = $this->bridge->inspectModules($chunk);
+            $this->writeFiles($this->generateForModules($structures));
+            $done += count($chunk);
+            $this->output->displayMessage(sprintf("  [%d/%d] modules processed", $done, $total), 1);
+        }
+
+        $this->output->displayMessage("Finished ✅", true, false);
 
         foreach ($this->importErrors as $module => $error) {
             $this->output->displayMessage("  ⚠️  $module: $error");
@@ -254,19 +271,66 @@ class PhpDocGeneratorService
 
     private function convertReturnType(string $type): string
     {
+        if ($type === '' || $type === 'Any') {
+            return 'mixed';
+        }
         if ($type === 'None' || $type === 'NoneType') {
             return 'void';
         }
 
         $converted = $this->convertType($type);
+        if ($converted !== '') {
+            return $converted;
+        }
 
-        // For return types, keep unknown types as-is so IDEs can resolve class names.
-        return $converted !== '' ? $converted : $type;
+        // Generic containers (list[int], dict[str, int], tuple[...]) map to array.
+        $base = strtolower(explode('[', $type, 2)[0]);
+        if (in_array($base, ['list', 'dict', 'tuple', 'set', 'frozenset', 'sequence', 'mapping', 'iterable'], true)) {
+            return 'array';
+        }
+
+        // Parameterised / union types we can't map to a single class (Optional[int],
+        // Union[...], etc.) — stay permissive.
+        if (str_contains($type, '[')) {
+            return 'mixed';
+        }
+
+        // A module-qualified class (requests.models.Response) points at the generated
+        // wrapper class \py\requests\models\Response, which shares the Python name.
+        if (str_contains($type, '.')) {
+            return $this->qualifyClass($type);
+        }
+
+        // Bare unknown class with no locatable module (e.g. a builtins object): it's
+        // wrapped as a PythonObject at runtime, and that type always resolves.
+        return '\\' . PythonObject::class;
+    }
+
+    /**
+     * Turn a module-qualified Python class name (e.g. "requests.models.Response")
+     * into the fully-qualified name of its generated PHP wrapper class
+     * (e.g. "\py\requests\models\Response").
+     */
+    private function qualifyClass(string $type): string
+    {
+        $parts = explode('.', $type);
+        $class = array_pop($parts);
+
+        // Match the sanitisation processEntity() applies to generated class names.
+        if (!Helpers::isIdentifier($class) || isset(Helpers::Keywords[strtolower($class)])) {
+            $class = '_' . $class;
+        }
+
+        return '\\' . implode('\\', [$this->namespace, ...$parts, $class]);
     }
 
     private function buildParamString(array $params): string
     {
         $parts = [];
+        // PHP forbids a required parameter after an optional one. Python has no such
+        // rule (keyword-only args can mix required/optional freely), so once we emit
+        // an optional param we must keep every following one optional too.
+        $optionalStarted = false;
         foreach ($params as $param) {
             $name = $param['name'] ?? '';
             if ($name === 'self' || $name === 'cls') {
@@ -279,11 +343,52 @@ class PhpDocGeneratorService
             $varName = '$' . ltrim($name, '*');
             $type = $this->convertType($param['type'] ?? '') ?: 'mixed';
             $spread = $isVariadic ? '...' : '';
-            $default = (!$isVariadic && ($param['default'] ?? null) === 'None') ? ' = null' : '';
+
+            // A variadic never takes a default and doesn't make later params optional.
+            $default = '';
+            if (!$isVariadic) {
+                $phpDefault = $this->convertDefault($param['default'] ?? null);
+                if ($phpDefault !== null) {
+                    $default = " = {$phpDefault}";
+                    $optionalStarted = true;
+                } elseif ($optionalStarted) {
+                    // Forced optional purely to keep valid ordering after a preceding
+                    // optional param; null is the only safe stand-in default.
+                    $default = ' = null';
+                }
+            }
 
             $parts[] = "{$type} {$spread}{$varName}{$default}";
         }
         return implode(', ', $parts);
+    }
+
+    /**
+     * Convert a Python default (an `repr()` string from the inspector) into a PHP
+     * literal usable in an `@method` signature. Returns null when the parameter has
+     * no default at all; falls back to `null` for values PHP can't represent.
+     */
+    private function convertDefault(?string $repr): ?string
+    {
+        if ($repr === null) {
+            return null;
+        }
+
+        return match ($repr) {
+            'None'  => 'null',
+            'True'  => 'true',
+            'False' => 'false',
+            default => match (true) {
+                // Integer / float literals are valid PHP as-is.
+                (bool) preg_match('/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/', $repr) => $repr,
+                // Single- or double-quoted string reprs are valid PHP string literals.
+                (bool) preg_match("/^'[^'\\\\]*'$/", $repr),
+                (bool) preg_match('/^"[^"\\\\]*"$/', $repr) => $repr,
+                // Anything else (objects, tuples, etc.) can't be rendered; keep the
+                // param optional with a safe placeholder.
+                default => 'null',
+            },
+        };
     }
 
     private function removeExcludedModules(array $modules): array
@@ -312,8 +417,13 @@ class PhpDocGeneratorService
     private function getModuleNamesByPackages(array $packages, bool $include_builtin_modules): array
     {
         $modules = [];
-        if (!empty($packages)) {
-            $package_names = array_map(fn($package) => $package->name, $packages);
+        // Path-only packages carry no distribution name, so they can't be mapped to
+        // their modules here; skip them (they contribute no name to look up).
+        $package_names = array_values(array_filter(
+            array_map(fn($package) => $package->name, $packages),
+            fn($name) => $name !== null
+        ));
+        if (!empty($package_names)) {
             $modules = [...$modules, ...$this->bridge->getModuleNamesInPackages($package_names)];
         }
         if ($include_builtin_modules) {

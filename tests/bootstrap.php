@@ -4,8 +4,8 @@ $libraryDir = dirname(__DIR__);
 $fixtureDir = $libraryDir . '/fixtures/project';
 
 // Install fixture if py stubs are not yet generated (json is stdlib — reliable indicator)
-if (!file_exists($fixtureDir . '/vendor/syncfly/python-in-php/py/json.php')) {
-    echo "Setting up test fixture (first run, takes a few minutes)...\n";
+//if (!file_exists($fixtureDir . '/vendor/syncfly/python-in-php/py/json.php')) {
+//    echo "Setting up test fixture (first run, takes a few minutes)...\n";
     $result = 0;
     passthru(
         'COMPOSER_ALLOW_SUPERUSER=1 composer install --no-interaction --no-ansi --no-dev -d ' . escapeshellarg($fixtureDir),
@@ -17,7 +17,7 @@ if (!file_exists($fixtureDir . '/vendor/syncfly/python-in-php/py/json.php')) {
             'Run manually: COMPOSER_ALLOW_SUPERUSER=1 composer install -d tests/fixtures/project'
         );
     }
-}
+//}
 
 // Composer may install the library into the fixture as a copy or a symlink,
 // depending on the local Composer/path repository behavior. Sync PHP files

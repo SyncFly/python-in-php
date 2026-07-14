@@ -225,7 +225,16 @@ class ModuleInspector:
     @staticmethod
     def get_type_name(type_hint) -> str:
         if type_hint is None: return "None"
-        if hasattr(type_hint, '__name__'): return type_hint.__name__
+        if hasattr(type_hint, '__name__'):
+            name = type_hint.__name__
+            module = getattr(type_hint, '__module__', None)
+            # Qualify real classes with their module (e.g. requests.models.Response)
+            # so the PHP generator can emit a resolvable \py\<module>\<Class> path.
+            # Builtins (int/str/...) and typing constructs stay bare so they map to
+            # PHP scalars / are handled generically.
+            if module and module not in ('builtins', 'typing'):
+                return f"{module}.{name}"
+            return name
         if hasattr(type_hint, '__origin__'):
             origin = type_hint.__origin__; origin_name = getattr(origin, '__name__', str(origin))
             if hasattr(type_hint, '__args__') and type_hint.__args__:

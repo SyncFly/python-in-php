@@ -28,11 +28,15 @@ class UvService
         $result = $this->executeUvCommand($project, 'pip', $args);
 
         $is_successful = $result['code'] === 0;
-        return [$is_successful, $is_successful ? "Installed {$package->name}" : "Failed to install: " . $result['output']];
+        return [$is_successful, $is_successful ? "Installed {$package->getLabel()}" : "Failed to install: " . $result['output']];
     }
 
     public function uninstallPackage(Package $package, Project $project): bool
     {
+        // uv can only uninstall by distribution name; a path-only package has none.
+        if ($package->name === null) {
+            return false;
+        }
         $result = $this->executeUvCommand($project, 'pip', ['uninstall', $package->name]);
         return $result['code'] === 0;
     }
@@ -51,7 +55,7 @@ class UvService
         $is_successful = $result['code'] === 0;
         $is_performed = !str_contains($result['output'], 'already satisfied');
 
-        return [$is_successful, $is_performed, $is_successful ? "Updated $package->name" : "Update failed"];
+        return [$is_successful, $is_performed, $is_successful ? "Updated {$package->getLabel()}" : "Update failed"];
     }
 
     public function runPython(array $arguments, Project $project): string
@@ -68,10 +72,35 @@ class UvService
         return $result['output'];
     }
 
+    /**
+     * Default uv's --torch-backend to "auto" for `pip install`, so uv picks the
+     * PyTorch wheel index matching the machine. Skipped if the caller already
+     * passed a value, or for non-install subcommands (which reject the flag).
+     */
+    private function withDefaultTorchBackend(array $arguments): array
+    {
+        if (($arguments[0] ?? null) !== 'install') {
+            return $arguments;
+        }
+
+        foreach ($arguments as $argument) {
+            if ($argument === '--torch-backend' || str_starts_with((string) $argument, '--torch-backend=')) {
+                return $arguments;
+            }
+        }
+
+        $arguments[] = '--torch-backend=auto';
+        return $arguments;
+    }
+
     private function executeUvCommand(Project $project, string $method, array $arguments): array
     {
         $uv_bin = $this->python_environment->getUvBinPath();
         $uv_env = $this->python_environment->getEnvDir($project->getPythonVersion()) . '/bin/python';
+
+        if ($method === 'pip') {
+            $arguments = $this->withDefaultTorchBackend($arguments);
+        }
 
         // Specify the path to venv via environment variable or --python flag
         // For uv pip we need to specify the path to python in venv

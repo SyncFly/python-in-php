@@ -124,41 +124,70 @@ class PythonManager
         $packages_to_refresh = $custom_refreshed;
         $existing_packages   = $this->project->getPackages();
 
-        foreach ($this->parseAddedPackages($result['output']) as $package) {
-            $should_save = $this->project->isAdded($package)
-                || $this->commandIncludesPackage($command, $package)
-                || in_array('--no-deps', $command)
-                || $has_custom_source;
+        // A bare path install doesn't carry the resolved name in the command, so read
+        // the primary distribution's name from the path to match it in the output. We
+        // keep that name (needed for later uninstall and PHP-doc generation) alongside
+        // the path (needed to reinstall from source).
+        $path_primary = $command_path !== null
+            ? $this->readPackageNameFromPath($command_path)
+            : null;
+        $path_primary = $path_primary !== null ? $this->normalizePackageName($path_primary) : null;
+        $path_primary_saved = false;
 
-            if (!$should_save) {
+        foreach ($this->parseAddedPackages($result['output']) as $package) {
+            $is_requested    = $this->commandIncludesPackage($command, $package);
+            $is_path_primary = $path_primary !== null
+                && $this->normalizePackageName($package->name) === $path_primary;
+            $is_tracked      = $this->project->isAdded($package);
+
+            // Persist only packages the user actually asked for: named in the command,
+            // the primary of a path install, or already tracked. Dependencies pulled in
+            // automatically are installed but never written to composer.json.
+            if (!$is_requested && !$is_path_primary && !$is_tracked) {
                 continue;
             }
 
             // Preserve index_url / path for packages that are already tracked.
-            if (isset($existing_packages[$package->name])) {
-                $existing        = $existing_packages[$package->name];
+            if (isset($existing_packages[$package->getKey()])) {
+                $existing           = $existing_packages[$package->getKey()];
                 $package->index_url = $existing->index_url;
                 $package->path      = $existing->path;
-            } elseif ($this->commandIncludesPackage($command, $package)) {
-                // Brand-new package: associate it with the source used in this command.
-                if ($command_index_url !== null) {
-                    $package->index_url = $command_index_url;
-                } elseif ($command_path !== null) {
+            } elseif ($command_index_url !== null && $is_requested) {
+                $package->index_url = $command_index_url;
+            }
+
+            // Record the path on the path install's primary package (keeping its name and
+            // version) so it reinstalls from source; dependencies are skipped above.
+            if ($is_path_primary) {
+                if ($package->path === null) {
                     $package->path = $command_path;
                 }
+                $path_primary_saved = true;
             }
 
             $this->project->addPackage($package);
             $packages_to_refresh[] = $package;
         }
 
+        // Fallback: a path install whose name we couldn't resolve is still tracked by its
+        // path alone so it reinstalls from source (uninstall / doc generation, which need
+        // the name, won't apply to it).
+        if ($command_path !== null && !$path_primary_saved && ($result['code'] ?? 1) === 0) {
+            $path_package = new Package(path: $command_path);
+            $this->project->addPackage($path_package);
+            $packages_to_refresh[] = $path_package;
+        }
+
         $this->saveProject();
 
-        if (!empty($packages_to_refresh) || $this->is_new_environment) {
+        $this->refreshPhpDocsForAllPackages();
+
+        //@TODO think about it
+        /*if (!empty($packages_to_refresh) || $this->is_new_environment) {
             $this->php_docs->refreshPhpDocs($packages_to_refresh, $this->is_new_environment);
         } elseif ($this->isPhpDocsMissing()) {
             $this->refreshPhpDocsForAllPackages();
-        }
+        }*/
     }
 
     public function handleUninstall(array $command)
@@ -237,8 +266,70 @@ class PythonManager
         return null;
     }
 
+    /**
+     * Best-effort read of a distribution's name from a local install source (a project
+     * directory or a wheel/sdist archive), so a "uv pip install ./pkg" can be matched to
+     * the package it produced. Returns null when the name can't be determined.
+     */
+    private function readPackageNameFromPath(string $path): ?string
+    {
+        // Wheel / sdist archive: the name is everything before the "-<version>" segment,
+        // e.g. requests-2.31.0-py3-none-any.whl or scikit_learn-1.4.0.tar.gz. The name
+        // itself may contain dashes, so anchor on the first "-" that starts the version.
+        $base = basename($path);
+        if (preg_match('/^(.+?)-\d.*\.(whl|tar\.gz|tgz|zip)$/', $base, $m)) {
+            return $m[1];
+        }
+
+        if (!is_dir($path)) {
+            return null;
+        }
+
+        // PEP 621 / Poetry: the top-level `name = "..."` key in pyproject.toml.
+        $pyproject = $path . DIRECTORY_SEPARATOR . 'pyproject.toml';
+        if (is_file($pyproject)
+            && preg_match('/^\s*name\s*=\s*["\']([^"\']+)["\']/m', (string) file_get_contents($pyproject), $m)) {
+            return $m[1];
+        }
+
+        // setup.cfg: [metadata] name = ...
+        $setup_cfg = $path . DIRECTORY_SEPARATOR . 'setup.cfg';
+        if (is_file($setup_cfg)) {
+            $ini = @parse_ini_file($setup_cfg, true);
+            if (!empty($ini['metadata']['name'])) {
+                return (string) $ini['metadata']['name'];
+            }
+        }
+
+        // Built metadata: *.egg-info/PKG-INFO or a top-level PKG-INFO (sdist), "Name: ...".
+        $pkg_infos = array_merge(
+            glob($path . DIRECTORY_SEPARATOR . '*.egg-info' . DIRECTORY_SEPARATOR . 'PKG-INFO') ?: [],
+            is_file($path . DIRECTORY_SEPARATOR . 'PKG-INFO') ? [$path . DIRECTORY_SEPARATOR . 'PKG-INFO'] : []
+        );
+        foreach ($pkg_infos as $pkg_info) {
+            if (preg_match('/^Name:\s*(.+)$/m', (string) file_get_contents($pkg_info), $m)) {
+                return trim($m[1]);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Normalise a distribution name for comparison per PEP 503: lowercase, with runs of
+     * "-", "_" and "." collapsed to a single "-" (so "Foo_Bar" == "foo-bar").
+     */
+    private function normalizePackageName(string $name): string
+    {
+        return strtolower((string) preg_replace('/[-_.]+/', '-', trim($name)));
+    }
+
     public function commandIncludesPackage(array $command, Package $package): bool
     {
+        // Path-only packages have no name to match against the command.
+        if ($package->name === null) {
+            return false;
+        }
         $name = preg_quote($package->name, '/');
         $name = str_replace(['\-', '\_', '-', '_'], '.', $name);
         $pattern = '/\b' . $name . '\b/';
@@ -421,7 +512,7 @@ class PythonManager
 
         $status = $is_successful ? "successfully installed" : "was not installed. $message";
         $icon = $is_successful ? "✅" : "❌";
-        $this->output->displayMessage("$icon \"$package->name\" $status");
+        $this->output->displayMessage("$icon \"{$package->getLabel()}\" $status");
 
         return $is_successful;
     }
@@ -432,7 +523,7 @@ class PythonManager
 
         $status = $is_successful ? "successfully uninstalled" : "is not installed";
         $icon = $is_successful ? "☑️" : "ℹ️";
-        $this->output->displayMessage("$icon \"$package->name\" $status");
+        $this->output->displayMessage("$icon \"{$package->getLabel()}\" $status");
     }
 
     private function updatePackage(Package $package): bool
@@ -441,7 +532,7 @@ class PythonManager
 
         $status = $is_successful ? ($is_performed ? "successfully updated to a new version" : "is already the newest version") : "was not updated. $message";
         $icon = $is_successful ? ($is_performed ? "⬆️" : "ℹ️") : "❌";
-        $this->output->displayMessage("$icon \"$package->name\" $status");
+        $this->output->displayMessage("$icon \"{$package->getLabel()}\" $status");
 
         return $is_successful && $is_performed;
     }

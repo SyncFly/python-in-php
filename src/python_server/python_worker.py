@@ -70,6 +70,41 @@ class ObjectReference:
         }
 
 
+class PhpCallbackProxy:
+    """A Python callable that forwards calls to a PHP callback.
+
+    Called from a worker thread, so __call__ marshals onto the event loop and
+    blocks on the future while the loop talks to PHP.
+    """
+
+    def __init__(self, server: "PythonBridgeServer", callback_id: str):
+        self._server = server
+        self._callback_id = callback_id
+
+    def __call__(self, *args, **kwargs):
+        server = self._server
+        if server.loop is None or server.current_websocket is None:
+            raise RuntimeError("PHP callback channel is not available")
+        future = asyncio.run_coroutine_threadsafe(
+            server._invoke_php_callback(self._callback_id, args, kwargs),
+            server.loop,
+        )
+        return future.result()
+
+    def __del__(self):
+        # Tell PHP it may drop the callable once the last proxy is gone. Guarded
+        # because __del__ can fire during interpreter shutdown.
+        try:
+            server = self._server
+            if server.loop is not None and not server.loop.is_closed():
+                asyncio.run_coroutine_threadsafe(
+                    server._release_php_callback(self._callback_id),
+                    server.loop,
+                )
+        except Exception:
+            pass
+
+
 class PythonBridgeServer:
     def __init__(self, host: str = 'localhost', port: int = 8765):
         self.host = host
@@ -91,6 +126,11 @@ class PythonBridgeServer:
         self.object_refs: Dict[str, weakref.ref] = {}
         self._serialization_depth = 0  # Serialization depth counter
         self._max_serialization_depth = 1000  # Max depth to prevent recursion
+
+        # Reverse channel for PHP callbacks (single PHP client, so one loop/socket).
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.current_websocket = None
+        self._php_callbacks: Dict[str, weakref.ref] = {}  # one proxy per callback id
 
         # Preload commonly used modules
         self.preload_common_modules()
@@ -300,6 +340,8 @@ class PythonBridgeServer:
         client_addr = websocket.remote_address
         logger.info(f"New connection: {client_addr}")
         self.clients.add(websocket)
+        # Track the active socket for PHP-callback invoke frames.
+        self.current_websocket = websocket
 
         try:
             async for message in websocket:
@@ -494,6 +536,9 @@ class PythonBridgeServer:
                 if obj is None:
                     raise ValueError(f'Object with ID {obj_id} not found')
                 return obj
+            elif data.get('__php_callable__'):
+                # A PHP callable — expose it as a callable proxy.
+                return self._get_or_make_php_callback(data.get('callback_id'))
             elif data.get('__python_type__') == 'dict':
                 # Reconstruct a Python dict from PHP PythonDict wrapper.
                 # Restore integer keys that were stringified by json_encode.
@@ -512,6 +557,97 @@ class PythonBridgeServer:
             return [self.resolve_object_references(item) for item in data]
         else:
             return data
+
+    # ---- Reverse channel: PHP callbacks exposed to Python -------------------
+
+    def _get_or_make_php_callback(self, callback_id: str) -> "PhpCallbackProxy":
+        """Return a single stable proxy per callback id (cached via weakref)."""
+        ref = self._php_callbacks.get(callback_id)
+        if ref is not None:
+            proxy = ref()
+            if proxy is not None:
+                return proxy
+        proxy = PhpCallbackProxy(self, callback_id)
+        self._php_callbacks[callback_id] = weakref.ref(proxy)
+        return proxy
+
+    @staticmethod
+    def _contains_php_callback(args, kwargs) -> bool:
+        """Whether a PHP callback proxy appears (possibly nested) in args/kwargs."""
+        def walk(value) -> bool:
+            if isinstance(value, PhpCallbackProxy):
+                return True
+            if isinstance(value, dict):
+                return any(walk(v) for v in value.values())
+            if isinstance(value, (list, tuple, set)):
+                return any(walk(v) for v in value)
+            return False
+        return walk(args) or walk(kwargs)
+
+    def _has_live_php_callback(self) -> bool:
+        """Whether any PHP callback proxy is still alive (may fire lazily, e.g. map()->list())."""
+        for ref in list(self._php_callbacks.values()):
+            if ref() is not None:
+                return True
+        return False
+
+    def _should_run_off_loop(self, args, kwargs) -> bool:
+        """Run user code in a worker thread if a PHP callback may be invoked."""
+        return self._contains_php_callback(args, kwargs) or self._has_live_php_callback()
+
+    async def _invoke_php_callback(self, callback_id: str, args, kwargs):
+        """Send an invoke frame to PHP and await its result.
+
+        Runs on the event loop. While awaiting PHP's reply it also services any
+        commands PHP issues from inside the callback (re-entrant Py:: calls).
+        """
+        websocket = self.current_websocket
+        if websocket is None:
+            raise RuntimeError("No active PHP connection for callback invocation")
+
+        frame_id = str(uuid.uuid4())
+        self._serialization_depth = 0
+        serialized_args = self.serialize_for_json(list(args))
+        self._serialization_depth = 0
+        serialized_kwargs = self.serialize_for_json(dict(kwargs))
+
+        await websocket.send(json.dumps({
+            'command': 'invoke_php_callback',
+            'callback_id': callback_id,
+            'args': serialized_args,
+            'kwargs': serialized_kwargs,
+            'id': frame_id,
+        }, ensure_ascii=False, default=str))
+
+        while True:
+            message = await websocket.recv()
+            frame = json.loads(message)
+
+            # PHP re-entered Python from inside the callback: handle the nested
+            # command and reply, then keep waiting for our callback result.
+            if frame.get('command') in self._command_handlers:
+                response = await self.process_command(frame)
+                await self.send_response(websocket, response)
+                continue
+
+            # Terminal callback result for this invocation.
+            if frame.get('error'):
+                raise RuntimeError(f"PHP callback failed: {frame.get('error')}")
+            return self.resolve_object_references(frame.get('callback_result'))
+
+    async def _release_php_callback(self, callback_id: str):
+        """Tell PHP it may drop a callback (fire-and-forget)."""
+        self._php_callbacks.pop(callback_id, None)
+        websocket = self.current_websocket
+        if websocket is None:
+            return
+        try:
+            await websocket.send(json.dumps({
+                'command': 'release_php_callback',
+                'callback_id': callback_id,
+            }))
+        except Exception as e:
+            logger.debug(f"Failed to send release for callback {callback_id}: {e}")
 
     async def process_command(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Process a command from PHP via the command registry."""
@@ -590,6 +726,9 @@ class PythonBridgeServer:
             try:
                 if asyncio.iscoroutinefunction(method):
                     result = await method(*processed_args, **processed_kwargs)
+                elif self._should_run_off_loop(processed_args, processed_kwargs):
+                    # PHP callback may be invoked: run off the event loop (see handle_call).
+                    result = await asyncio.to_thread(method, *processed_args, **processed_kwargs)
                 else:
                     result = method(*processed_args, **processed_kwargs)
 
@@ -655,6 +794,9 @@ class PythonBridgeServer:
             try:
                 if asyncio.iscoroutinefunction(obj):
                     result = await obj(*processed_args, **processed_kwargs)
+                elif self._should_run_off_loop(processed_args, processed_kwargs):
+                    # PHP callback may be invoked: run off the event loop (see handle_call).
+                    result = await asyncio.to_thread(obj, *processed_args, **processed_kwargs)
                 else:
                     result = obj(*processed_args, **processed_kwargs)
 
@@ -1057,6 +1199,10 @@ class PythonBridgeServer:
             try:
                 if asyncio.iscoroutinefunction(func):
                     result = await func(*processed_args, **processed_kwargs)
+                elif self._should_run_off_loop(processed_args, processed_kwargs):
+                    # Run off the event loop so it can service PHP callback frames
+                    # (calling inline would deadlock).
+                    result = await asyncio.to_thread(func, *processed_args, **processed_kwargs)
                 else:
                     result = func(*processed_args, **processed_kwargs)
 
@@ -1237,6 +1383,9 @@ class PythonBridgeServer:
     async def start_server(self):
         """Start the WebSocket server"""
         print("Modules available:", list(self.modules.keys()))
+
+        # Loop reference for PHP-callback proxies (run_coroutine_threadsafe).
+        self.loop = asyncio.get_running_loop()
 
         self.server = await websockets.serve(
             self.handle_client,
