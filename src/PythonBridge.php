@@ -354,18 +354,19 @@ class PythonBridge
     }
 
     /**
-     * Working with Python's context manager
+     * Run a callback inside a Python context manager, like Python's `with`.
+     * The callback receives the entered value (the `as` target), and the context
+     * is exited afterwards even if the callback throws. Returns the callback result.
      */
-    public function with($objId, callable $callback)
+    public function with(PythonObject|string $context, callable $callback)
     {
+        $objId = $context instanceof PythonObject ? $context->getObjectId() : $context;
+
         try {
-            // Enter context
-            $this->execute('context_enter', ['obj_id' => $objId]);
+            $entered = $this->execute('context_enter', ['obj_id' => $objId]);
 
-            // Callback execution
-            $result = $callback();
+            $result = $callback($entered);
 
-            // Exit the context
             $this->execute('context_exit', ['obj_id' => $objId]);
 
             return $result;

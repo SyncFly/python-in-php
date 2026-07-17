@@ -160,18 +160,29 @@ echo $response->status_code; // attribute access
 
 ### Context managers
 
-Use `PythonBridge::with()` to work with Python context managers:
+Use `Py::with()` to run code inside a Python context manager — the equivalent of
+Python's `with` statement. The context is exited afterwards even if the callback
+throws.
 
 ```php
 <?php
 
-use Python_In_PHP\PythonBridge;
-use py\open;
+use py\builtins;
 
-$bridge = PythonBridge::startOrGetRunning();
-$file = $bridge->importModule('builtins');
-// ...
+// with file:
+$file = builtins::open('/tmp/data.txt', 'w');
+Py::with($file, function () use ($file) {
+    $file->write('hello');
+});
+
+// with open(...) as f:  — the callback receives the entered value
+Py::with(builtins::open('/tmp/data.txt', 'a'), function ($f) {
+    $f->write(' world');
+});
+// the file is closed automatically when the context exits
 ```
+
+`Py::with()` returns whatever the callback returns.
 
 ### PHP callbacks in Python
 
