@@ -11,7 +11,7 @@ class UvPythonEnvironmentService
 {
     use CommandLineTrait;
 
-    public $uv_version = '0.9.26';
+    public $uv_version = '0.11.29';
 
     public function __construct(
         private string $dir,
@@ -25,7 +25,7 @@ class UvPythonEnvironmentService
     public function installUvIfMissing(): void
     {
         $uv_bin = $this->getUvBinPath();
-        if (file_exists($uv_bin)) return;
+        if (file_exists($uv_bin) && !$this->isUvOutdated($uv_bin)) return;
 
         $os = PHP_OS_FAMILY;
         $arch = php_uname('m');
@@ -67,6 +67,29 @@ class UvPythonEnvironmentService
         }
 
         unlink($target);
+    }
+
+    /**
+     * GPU support (notably ROCm auto-detection and current CUDA/ROCm indexes for
+     * --torch-backend=auto) depends on the uv release, so an existing binary older
+     * than $uv_version is re-downloaded. If the version cannot be determined, the
+     * existing binary is kept.
+     */
+    private function isUvOutdated(string $uv_bin): bool
+    {
+        $result = $this->runCommand(escapeshellarg($uv_bin) . ' --version');
+        $installed_version = $result['code'] === 0 ? $this->parseUvVersion($result['output']) : null;
+
+        if ($installed_version === null) {
+            return false;
+        }
+
+        return version_compare($installed_version, $this->uv_version, '<');
+    }
+
+    public function parseUvVersion(string $version_output): ?string
+    {
+        return preg_match('/\buv\s+(\d+\.\d+\.\d+)/', $version_output, $matches) ? $matches[1] : null;
     }
 
     public function createEnvironment(string $python_version): void

@@ -92,7 +92,8 @@ composer pip install requests
 # Install a specific version
 composer pip install "numpy:^1.24"
 
-# Install with a custom PyPI index (e.g. PyTorch with ROCm)
+# Install with a custom PyPI index
+# (for PyTorch the right GPU index is normally picked automatically — see below)
 composer pip install torch --index-url https://download.pytorch.org/whl/rocm6.3
 
 # Install a local package from a directory
@@ -106,6 +107,19 @@ composer pip install --upgrade numpy
 ```
 
 Installed packages and their sources are saved to `composer.json` under `extra.python-in-php.packages` and are re-installed automatically on the next `composer install`.
+
+### PyTorch GPU backends
+
+`composer pip install torch` picks the right PyTorch build for your hardware automatically:
+
+- **NVIDIA (CUDA), AMD (ROCm), Intel (XPU)** — on Linux and Windows the install runs with uv's `--torch-backend=auto`, which detects the GPU and driver and selects the matching wheel index (e.g. `cu130`, `rocm7.2`).
+- **Apple (MPS)** — on macOS the standard PyPI wheels already include Metal/MPS support, so no index override is applied.
+
+To force a specific backend, set the `PYTHON_IN_PHP_TORCH_BACKEND` environment variable (e.g. `cpu`, `cu128`, `rocm7.2`, or `none` to disable the default) or pass `--torch-backend=...` explicitly:
+
+```bash
+PYTHON_IN_PHP_TORCH_BACKEND=cpu composer pip install torch
+```
 
 ## Configuration
 

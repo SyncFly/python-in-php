@@ -73,11 +73,16 @@ class UvService
     }
 
     /**
-     * Default uv's --torch-backend to "auto" for `pip install`, so uv picks the
-     * PyTorch wheel index matching the machine. Skipped if the caller already
-     * passed a value, or for non-install subcommands (which reject the flag).
+     * Pick the PyTorch accelerator for `pip install`:
+     *  - Linux/Windows: default uv's --torch-backend to "auto", so uv detects the
+     *    GPU (NVIDIA CUDA, AMD ROCm, Intel XPU) and picks the matching wheel index.
+     *  - macOS: pass no flag — the regular PyPI wheels already ship Metal/MPS
+     *    support, and --torch-backend would needlessly pin the CPU-only index.
+     * An explicit --torch-backend from the caller, or the PYTHON_IN_PHP_TORCH_BACKEND
+     * environment variable (e.g. "cu128", "rocm7.2", "cpu", or "none" to disable),
+     * takes precedence. Non-install subcommands reject the flag and are left as is.
      */
-    private function withDefaultTorchBackend(array $arguments): array
+    private function withDefaultTorchBackend(array $arguments, ?string $os_family = null): array
     {
         if (($arguments[0] ?? null) !== 'install') {
             return $arguments;
@@ -89,7 +94,19 @@ class UvService
             }
         }
 
-        $arguments[] = '--torch-backend=auto';
+        $backend = getenv('PYTHON_IN_PHP_TORCH_BACKEND');
+        if ($backend === false || $backend === '') {
+            if (($os_family ?? PHP_OS_FAMILY) === 'Darwin') {
+                return $arguments;
+            }
+            $backend = 'auto';
+        }
+
+        if (strtolower($backend) === 'none') {
+            return $arguments;
+        }
+
+        $arguments[] = '--torch-backend=' . $backend;
         return $arguments;
     }
 
