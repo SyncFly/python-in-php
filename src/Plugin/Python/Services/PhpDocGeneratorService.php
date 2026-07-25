@@ -17,7 +17,7 @@ class PhpDocGeneratorService
 {
     // Modules inspected per round-trip. Large enough to keep the Python-side worker
     // pool saturated, small enough that the progress counter advances visibly.
-    private const PROGRESS_CHUNK_SIZE = 12;
+    private const PROGRESS_CHUNK_SIZE = 24;
 
     private ?PythonBridge $bridge;
     private PythonObject $sys;
@@ -83,11 +83,39 @@ class PhpDocGeneratorService
             $this->output->displayMessage(sprintf("  [%d/%d] modules processed", $done, $total), 1);
         }
 
-        $this->output->displayMessage("Finished ✅", true, false);
+        $this->output->displayMessage("  ✅ Done");
 
-        foreach ($this->importErrors as $module => $error) {
-            $this->output->displayMessage("  ⚠️  $module: $error");
+        $this->reportImportErrors();
+    }
+
+    /**
+     * -v shows every import error in full; otherwise expected noise (missing modules,
+     * platform-only stubs) is dropped and real failures are listed compactly by name.
+     */
+    private function reportImportErrors(): void
+    {
+        if (empty($this->importErrors)) return;
+
+        if ($this->output->isVerbose()) {
+            foreach ($this->importErrors as $module => $error) {
+                $this->output->displayMessage("  ⚠️  $module: $error");
+            }
+            return;
         }
+
+        $real_errors = array_filter($this->importErrors, fn($error) => !$this->isIgnorableImportError($error));
+        if (empty($real_errors)) return;
+
+        $modules = implode(', ', array_keys($real_errors));
+        $this->output->displayMessage("  ⚠️  Could not import: $modules", 1);
+        $this->output->displayMessage("  (run with -v for details)");
+    }
+
+    /** Expected, non-actionable import failures: a module that isn't installed or a wrong-OS stub. */
+    private function isIgnorableImportError(string $error): bool
+    {
+        return str_contains($error, 'ModuleNotFoundError: No module named')
+            || str_contains($error, 'ImportError: win32 only');
     }
 
     public function refreshPhpDocsForAllModules(): void

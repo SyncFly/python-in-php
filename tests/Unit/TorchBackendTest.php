@@ -3,10 +3,7 @@
 use Python_In_PHP\Plugin\Python\Services\UvPythonEnvironmentService;
 use Python_In_PHP\Plugin\Python\Services\UvService;
 
-/**
- * Unit tests for the default --torch-backend injection in UvService
- * and the uv version parsing used for self-upgrade.
- */
+// Default --torch-backend injection and uv version parsing
 
 function torchBackend(array $arguments, string $os_family = 'Linux'): array
 {

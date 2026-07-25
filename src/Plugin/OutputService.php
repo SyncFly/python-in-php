@@ -54,6 +54,11 @@ class OutputService
         }
     }
 
+    public function isVerbose(): bool
+    {
+        return $this->controls->isVerbose();
+    }
+
     public function isDebug(): bool
     {
         return $this->controls->isDebug();

@@ -8,8 +8,10 @@ use Python_In_PHP\Plugin\Python\Entities\Package;
 use Python_In_PHP\Plugin\Python\Entities\PackageVersion;
 use Python_In_PHP\Plugin\Python\Entities\Project;
 use Python_In_PHP\Plugin\Python\Services\PhpDocGeneratorService;
+use Python_In_PHP\Plugin\Python\Services\PythonLockFileService;
 use Python_In_PHP\Plugin\Python\Services\UvPythonEnvironmentService;
 use Python_In_PHP\Plugin\Python\Services\UvService;
+use Python_In_PHP\Plugin\Utils;
 
 class PythonManager
 {
@@ -27,6 +29,7 @@ class PythonManager
     private UvPythonEnvironmentService $python_environment;
     private UvService $python_service;
     private PhpDocGeneratorService $php_docs;
+    private PythonLockFileService $lock_service;
 
     private Project $project;
 
@@ -43,7 +46,10 @@ class PythonManager
         if (!is_dir($this->dir)) mkdir($this->dir, recursive: true);
         $this->dir = realpath($this->dir);
 
+        $this->lock_service = new PythonLockFileService(dirname($this->composer->getConfig()->get('vendor-dir')), $this->output);
+
         $this->project = Project::loadFromComposerExtras($this->getAllComposerExtras());
+        $this->applyLockFile();
 
         $this->python_environment = new UvPythonEnvironmentService($this->dir, $this->bin_dir, $this->output);
         $this->python_environment->installUvIfMissing();
@@ -79,32 +85,32 @@ class PythonManager
 
     public function handleInstall(array $command = ['install'])
     {
+        // The command the user actually typed, before stored packages are appended below.
+        $user_command = $command;
+
         $command_index_url = $this->extractOptionValue($command, '--index-url');
         $command_path      = $this->extractPathFromCommand($command);
         $has_custom_source = $command_index_url !== null || $command_path !== null;
 
         if (!$has_custom_source && !in_array('--no-deps', $command)) {
-            // Standard flow: append stored packages that have no custom source to the main
-            // command so they all get reinstalled in a single uv invocation.
+            // Append stored packages without a custom source to reinstall everything in one uv call
             foreach ($this->project->getPackages() as $package) {
                 if (!$this->commandIncludesPackage($command, $package)
                     && $package->index_url === null && $package->path === null) {
+                    // --upgrade resolves anew within the constraint instead of reinstalling the pin
                     $command[] = in_array('--upgrade', $command)
-                        ? $package->name
+                        ? $package->name . $package->version->convertToPip()
                         : $package->getInstallSpec();
                 }
             }
         }
-        // When the user command already carries --index-url or a local path we intentionally
-        // do NOT append other stored packages: mixing them into the same uv invocation would
-        // route all of them through the custom index, breaking packages that live on PyPI.
+        // With a custom --index-url/path, stored packages are not appended: they would all go through the custom index
 
         $result = $this->python_service->executePipCommand($this->project, $command);
 
         $this->output->displayMessage($result['output']);
 
-        // Packages with custom sources (index_url / path) are always installed one-by-one so
-        // that each uv call can carry the right --index-url for that package.
+        // Custom-source packages are installed one-by-one, each with its own --index-url
         $custom_refreshed = [];
         if (!$has_custom_source && !in_array('--no-deps', $command)) {
             foreach ($this->project->getPackages() as $package) {
@@ -120,14 +126,29 @@ class PythonManager
             }
         }
 
-        // Parse the main-command output and persist newly installed packages.
-        $packages_to_refresh = $custom_refreshed;
+        $packages_to_refresh = array_merge(
+            $custom_refreshed,
+            $this->persistInstalledPackages($command, $result, $command_index_url, $command_path, $user_command)
+        );
+
+        $this->captureMissingPins();
+
+        $this->saveProject();
+
+        $this->refreshPhpDocsForAllPackages();
+    }
+
+    /** Parses the install output, persists newly installed packages and returns them. */
+    private function persistInstalledPackages(array $command, array $result, ?string $command_index_url, ?string $command_path, array $user_command = []): array
+    {
+        $packages_to_refresh = [];
         $existing_packages   = $this->project->getPackages();
 
-        // A bare path install doesn't carry the resolved name in the command, so read
-        // the primary distribution's name from the path to match it in the output. We
-        // keep that name (needed for later uninstall and PHP-doc generation) alongside
-        // the path (needed to reinstall from source).
+        // An auto-detected GPU backend is machine-specific, so its "+cu126" segment must not be persisted
+        $backend_auto = $command_index_url === null
+            && UvService::resolveTorchBackend($user_command ?: $command) === 'auto';
+
+        // For path installs, resolve the distribution name to match it in the output
         $path_primary = $command_path !== null
             ? $this->readPackageNameFromPath($command_path)
             : null;
@@ -140,24 +161,22 @@ class PythonManager
                 && $this->normalizePackageName($package->name) === $path_primary;
             $is_tracked      = $this->project->isAdded($package);
 
-            // Persist only packages the user actually asked for: named in the command,
-            // the primary of a path install, or already tracked. Dependencies pulled in
-            // automatically are installed but never written to composer.json.
+            // Auto-pulled dependencies are installed but never written to composer.json
             if (!$is_requested && !$is_path_primary && !$is_tracked) {
                 continue;
             }
 
-            // Preserve index_url / path for packages that are already tracked.
+            // Keep source config and ownership; only an explicit request promotes an included package to root
             if (isset($existing_packages[$package->getKey()])) {
                 $existing           = $existing_packages[$package->getKey()];
                 $package->index_url = $existing->index_url;
                 $package->path      = $existing->path;
+                $package->from_included_package = $existing->from_included_package && !$is_requested;
             } elseif ($command_index_url !== null && $is_requested) {
                 $package->index_url = $command_index_url;
             }
 
-            // Record the path on the path install's primary package (keeping its name and
-            // version) so it reinstalls from source; dependencies are skipped above.
+            // Keep the path so the package reinstalls from source
             if ($is_path_primary) {
                 if ($package->path === null) {
                     $package->path = $command_path;
@@ -165,29 +184,137 @@ class PythonManager
                 $path_primary_saved = true;
             }
 
+            // The exact installed version becomes the lock pin; the auto-detected GPU backend
+            // segment is machine-specific and dropped unless the source pins it
+            $exact = $package->version->toString();
+            if ($backend_auto && $package->index_url === null && $package->path === null
+                && !$this->commandPinsLocalVersion($user_command ?: $command, $package)) {
+                $exact = $this->stripLocalVersion($exact);
+            }
+            $package->locked_version = $exact;
+            $package->version = $this->resolveConstraint($package, $existing_packages[$package->getKey()] ?? null, $user_command ?: $command, $exact);
+
             $this->project->addPackage($package);
             $packages_to_refresh[] = $package;
         }
 
-        // Fallback: a path install whose name we couldn't resolve is still tracked by its
-        // path alone so it reinstalls from source (uninstall / doc generation, which need
-        // the name, won't apply to it).
+        // A path install with an unresolved name is still tracked by its path alone
         if ($command_path !== null && !$path_primary_saved && ($result['code'] ?? 1) === 0) {
             $path_package = new Package(path: $command_path);
             $this->project->addPackage($path_package);
             $packages_to_refresh[] = $path_package;
         }
 
-        $this->saveProject();
+        return $packages_to_refresh;
+    }
 
-        $this->refreshPhpDocsForAllPackages();
+    /** The composer.json constraint for a persisted package: explicit specifier > kept constraint > caret of the pin. */
+    private function resolveConstraint(Package $package, ?Package $existing, array $user_command, string $exact): PackageVersion
+    {
+        $specifier = $this->extractRequestedConstraint($user_command, $package);
+        if ($specifier !== null) {
+            return new PackageVersion($specifier);
+        }
+        if ($existing !== null) {
+            // An explicit bare-name request may move the version outside the old constraint, widening it
+            $package->version = $existing->version;
+            $is_widened = !$package->satisfiesConstraint() && $this->commandIncludesPackage($user_command, $package);
+            if (!$is_widened) {
+                return $existing->version;
+            }
+        }
+        return $this->approximateConstraint($exact);
+    }
 
-        //@TODO think about it
-        /*if (!empty($packages_to_refresh) || $this->is_new_environment) {
-            $this->php_docs->refreshPhpDocs($packages_to_refresh, $this->is_new_environment);
-        } elseif ($this->isPhpDocsMissing()) {
-            $this->refreshPhpDocsForAllPackages();
-        }*/
+    /** Caret constraint for a plain numeric version, an exact pin otherwise (pre/post-releases). */
+    private function approximateConstraint(string $exact): PackageVersion
+    {
+        $public = $this->stripLocalVersion($exact);
+        return preg_match('/^\d+(?:\.\d+){0,2}$/', $public)
+            ? new PackageVersion('^' . $public)
+            : new PackageVersion('==' . $public);
+    }
+
+    /** The version specifier the user typed for this package (e.g. "==2.31.0", ">=2.0"), or null. */
+    private function extractRequestedConstraint(array $command, Package $package): ?string
+    {
+        if ($package->name === null) {
+            return null;
+        }
+        foreach ($command as $part) {
+            $part = trim((string) $part, "\"'");
+            if (!preg_match('/^([A-Za-z0-9._-]+)((?:===|==|~=|!=|>=|<=|>|<).*)$/', $part, $m)) {
+                continue;
+            }
+            if ($this->normalizePackageName($m[1]) === $this->normalizePackageName($package->name)) {
+                return trim($m[2]);
+            }
+        }
+        return null;
+    }
+
+    /** Loads exact pins from python-in-php.lock and drops pins that no longer fit their constraint. */
+    private function applyLockFile(): void
+    {
+        $orphans = $this->project->applyLockData($this->lock_service->read());
+        foreach ($orphans as $name) {
+            $this->output->verboseMessage("Dropping the stale lock pin for \"$name\": the package is no longer declared in composer.json");
+        }
+        foreach ($this->project->getPackages() as $package) {
+            if (!$package->satisfiesConstraint()) {
+                $this->output->displayMessage("⚠️ The locked version {$package->locked_version} of \"{$package->getLabel()}\" does not satisfy the constraint \"{$package->version->toString()}\", so it will be resolved again");
+                $package->locked_version = null;
+            }
+        }
+    }
+
+    /** Fills lock pins for tracked packages already present in the environment, so uv reported no install for them. */
+    private function captureMissingPins(): void
+    {
+        $missing = array_filter(
+            $this->project->getPackages(),
+            fn($package) => $package->name !== null && $package->locked_version === null
+        );
+        if ($missing === []) {
+            return;
+        }
+
+        $result = $this->python_service->executePipCommand($this->project, ['freeze']);
+        if ($result['code'] !== 0) {
+            return;
+        }
+
+        $installed = [];
+        foreach (explode("\n", $result['output']) as $line) {
+            if (preg_match('/^([A-Za-z0-9._-]+)==(.+)$/', trim($line), $m)) {
+                $installed[$this->normalizePackageName($m[1])] = trim($m[2]);
+            }
+        }
+
+        foreach ($missing as $package) {
+            $version = $installed[$this->normalizePackageName($package->name)] ?? null;
+            if ($version === null) {
+                continue;
+            }
+            // The machine-specific GPU segment is only kept when the source or the constraint pins it
+            $keep_local = $package->index_url !== null || $package->path !== null
+                || str_contains($package->version->toString(), '+');
+            $package->locked_version = $keep_local ? $version : $this->stripLocalVersion($version);
+        }
+    }
+
+    /** Reads the exact installed version of the package from uv's output into its lock pin. */
+    private function captureLockedVersion(Package $package, string $output): void
+    {
+        if ($package->name === null) {
+            return;
+        }
+        foreach ($this->parseAddedPackages($output) as $added) {
+            if ($this->normalizePackageName($added->name) === $this->normalizePackageName($package->name)) {
+                $package->locked_version = $added->version->toString();
+                return;
+            }
+        }
     }
 
     public function handleUninstall(array $command)
@@ -315,13 +442,31 @@ class PythonManager
         return null;
     }
 
-    /**
-     * Normalise a distribution name for comparison per PEP 503: lowercase, with runs of
-     * "-", "_" and "." collapsed to a single "-" (so "Foo_Bar" == "foo-bar").
-     */
+    /** PEP 503 name normalisation (so "Foo_Bar" == "foo-bar"). */
     private function normalizePackageName(string $name): string
     {
-        return strtolower((string) preg_replace('/[-_.]+/', '-', trim($name)));
+        return Utils::normalizePackageName($name);
+    }
+
+    /** Drops the PEP 440 local version segment ("2.7.0+rocm6.3" -> "2.7.0"). */
+    private function stripLocalVersion(string $version): string
+    {
+        $plus = strpos($version, '+');
+        return $plus === false ? $version : substr($version, 0, $plus);
+    }
+
+    /** Whether the command pins this package to a specific local version (e.g. "torch==2.7.0+cu118"). */
+    private function commandPinsLocalVersion(array $command, Package $package): bool
+    {
+        if ($package->name === null) {
+            return false;
+        }
+        foreach ($command as $part) {
+            if (str_contains((string) $part, '+') && $this->commandIncludesPackage([$part], $package)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public function commandIncludesPackage(array $command, Package $package): bool
@@ -501,14 +646,22 @@ class PythonManager
         if (!$is_created && $need_to_refresh) $this->refreshPhpDocsForAllPackages();
     }
 
-    public function run(array $arguments): void
+    public function run(array $arguments): int
     {
-        echo $this->python_service->runPython($arguments, $this->project);
+        return $this->python_service->runPython($arguments, $this->project);
+    }
+
+    public function getPythonVersion(): string
+    {
+        return $this->project->getPythonVersion();
     }
 
     private function installPackage(Package $package): bool
     {
-        [$is_successful, $message] = $this->python_service->installPackage($package, $this->project);
+        [$is_successful, $message, $uv_output] = $this->python_service->installPackage($package, $this->project);
+        if ($is_successful) {
+            $this->captureLockedVersion($package, $uv_output);
+        }
 
         $status = $is_successful ? "successfully installed" : "was not installed. $message";
         $icon = $is_successful ? "✅" : "❌";
@@ -528,7 +681,10 @@ class PythonManager
 
     private function updatePackage(Package $package): bool
     {
-        [$is_successful, $is_performed, $message] = $this->python_service->updatePackage($package, $this->project);
+        [$is_successful, $is_performed, $message, $uv_output] = $this->python_service->updatePackage($package, $this->project);
+        if ($is_successful && $is_performed) {
+            $this->captureLockedVersion($package, $uv_output);
+        }
 
         $status = $is_successful ? ($is_performed ? "successfully updated to a new version" : "is already the newest version") : "was not updated. $message";
         $icon = $is_successful ? ($is_performed ? "⬆️" : "ℹ️") : "❌";
@@ -591,7 +747,12 @@ class PythonManager
     private function saveProject()
     {
         $composer_json_path = dirname($this->composer->getConfig()->get('vendor-dir')) . '/composer.json';
-        $this->project->saveInComposerJson($composer_json_path);
+        $changed = $this->project->saveInComposerJson($composer_json_path);
+        // The extra section takes part in composer.lock's content-hash, so keep the hash fresh
+        if ($changed) {
+            $this->lock_service->patchComposerLockHash();
+        }
+        $this->lock_service->write($this->project->toLockArray());
     }
 
     private function isPhpDocsMissing(): bool

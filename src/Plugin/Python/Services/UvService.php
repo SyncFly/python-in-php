@@ -28,7 +28,7 @@ class UvService
         $result = $this->executeUvCommand($project, 'pip', $args);
 
         $is_successful = $result['code'] === 0;
-        return [$is_successful, $is_successful ? "Installed {$package->getLabel()}" : "Failed to install: " . $result['output']];
+        return [$is_successful, $is_successful ? "Installed {$package->getLabel()}" : "Failed to install: " . $result['output'], $result['output']];
     }
 
     public function uninstallPackage(Package $package, Project $project): bool
@@ -43,7 +43,9 @@ class UvService
 
     public function updatePackage(Package $package, Project $project): array
     {
-        $args = ['install', '--upgrade', $package->getInstallSpec()];
+        // An upgrade resolves anew within the constraint instead of reinstalling the exact pin
+        $spec = $package->path !== null ? $package->path : $package->name . $package->version->convertToPip();
+        $args = ['install', '--upgrade', $spec];
 
         if ($package->index_url !== null) {
             $args[] = '--index-url';
@@ -55,59 +57,71 @@ class UvService
         $is_successful = $result['code'] === 0;
         $is_performed = !str_contains($result['output'], 'already satisfied');
 
-        return [$is_successful, $is_performed, $is_successful ? "Updated {$package->getLabel()}" : "Update failed"];
+        return [$is_successful, $is_performed, $is_successful ? "Updated {$package->getLabel()}" : "Update failed", $result['output']];
     }
 
-    public function runPython(array $arguments, Project $project): string
+    /** Run the venv Python with the given arguments, streaming its output live; returns the exit code. */
+    public function runPython(array $arguments, Project $project): int
     {
-        // uv run automatically picks up the environment if we are in the right directory,
-        // or we can pass the path to python directly
-        $python_bin = $this->python_environment->getPythonBinPath();
-        $python_bin = realpath($python_bin);
+        // Resolve only the python_bin symlink (to the venv's bin), not the full chain: fully
+        // resolving it would land on the base interpreter and lose the venv's site-packages.
+        $python_bin = $this->python_environment->getPythonBinPathReal();
         $arguments_string = implode(' ', array_map('escapeshellarg', $arguments));
 
-        $cmd = escapeshellarg($python_bin) . " " . $arguments_string;
-        $result = $this->runCommand($cmd);
+        $cmd = escapeshellarg($python_bin) . ' ' . $arguments_string;
+        passthru($cmd, $exit_code);
 
-        return $result['output'];
+        return $exit_code;
     }
 
-    /**
-     * Pick the PyTorch accelerator for `pip install`:
-     *  - Linux/Windows: default uv's --torch-backend to "auto", so uv detects the
-     *    GPU (NVIDIA CUDA, AMD ROCm, Intel XPU) and picks the matching wheel index.
-     *  - macOS: pass no flag — the regular PyPI wheels already ship Metal/MPS
-     *    support, and --torch-backend would needlessly pin the CPU-only index.
-     * An explicit --torch-backend from the caller, or the PYTHON_IN_PHP_TORCH_BACKEND
-     * environment variable (e.g. "cu128", "rocm7.2", "cpu", or "none" to disable),
-     * takes precedence. Non-install subcommands reject the flag and are left as is.
-     */
+    /** Defaults --torch-backend=auto on installs; skipped on macOS (PyPI wheels ship MPS), overridable via PYTHON_IN_PHP_TORCH_BACKEND ("none" disables). */
     private function withDefaultTorchBackend(array $arguments, ?string $os_family = null): array
     {
-        if (($arguments[0] ?? null) !== 'install') {
+        $backend = self::resolveTorchBackend($arguments, $os_family);
+        if ($backend === null) {
             return $arguments;
         }
 
+        // An explicit flag is already present in that case, so leave the arguments untouched.
         foreach ($arguments as $argument) {
             if ($argument === '--torch-backend' || str_starts_with((string) $argument, '--torch-backend=')) {
                 return $arguments;
             }
         }
 
+        $arguments[] = '--torch-backend=' . $backend;
+        return $arguments;
+    }
+
+    /** The applied --torch-backend value, or null when none applies; "auto" means auto-detected, not user-pinned. */
+    public static function resolveTorchBackend(array $arguments, ?string $os_family = null): ?string
+    {
+        if (($arguments[0] ?? null) !== 'install') {
+            return null;
+        }
+
+        foreach ($arguments as $i => $argument) {
+            if ($argument === '--torch-backend') {
+                return $arguments[$i + 1] ?? null;
+            }
+            if (str_starts_with((string) $argument, '--torch-backend=')) {
+                return substr((string) $argument, strlen('--torch-backend='));
+            }
+        }
+
         $backend = getenv('PYTHON_IN_PHP_TORCH_BACKEND');
         if ($backend === false || $backend === '') {
             if (($os_family ?? PHP_OS_FAMILY) === 'Darwin') {
-                return $arguments;
+                return null;
             }
-            $backend = 'auto';
+            return 'auto';
         }
 
         if (strtolower($backend) === 'none') {
-            return $arguments;
+            return null;
         }
 
-        $arguments[] = '--torch-backend=' . $backend;
-        return $arguments;
+        return $backend;
     }
 
     private function executeUvCommand(Project $project, string $method, array $arguments): array

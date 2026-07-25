@@ -1,24 +1,12 @@
-
-> ⏳ The project is currently under active development. It is still in the beta stage, but it is already working.
-> <br/>⭐️ Star the repository to support the project and follow us
+# Python packages in PHP
 
 <table>
 <tr>
 <td valign="top">
 
-#### Python-in-PHP
+### Python-in-PHP
 
 The **Python-in-PHP** library allows you to easily use any Python packages as if they were native PHP packages 🐘
-
-🔥 Fully use artificial intelligence frameworks for AI models inference or training directly in PHP!
-<br/>
-You can run AI models with libraries like `transformers`, `torch`, `vllm`, `numpy`, etc. in your PHP project with PHP syntax.
-</td>
-<td style="max-width: 30%" valign="center">
-<img src="image.png" alt="Python-in-PHP" width="200"/>
-</td>
-</tr>
-</table>
 
 ✅ Environment with Python is installed automatically with Composer.
 
@@ -26,6 +14,18 @@ You can run AI models with libraries like `transformers`, `torch`, `vllm`, `nump
 
 ✅ Automatic PHPDoc generation for code completion in IDEs for any Python packages.
 
+</td>
+<td style="max-width: 30%" valign="center">
+<img src="image.png" alt="Python-in-PHP" width="200"/>
+</td>
+</tr>
+</table>
+
+🔥 Fully use artificial intelligence frameworks for AI models inference or training directly in PHP!
+<br/>
+You can run AI models with libraries like `transformers`, `torch`, `vllm`, `numpy`, etc. in your PHP project with PHP syntax.
+<br/>
+See **[syncfly/transformers-torch-php](https://github.com/SyncFly/transformers-torch-php)** for a quick start with `transformers` and `torch`.
 
 ## System requirements
 
@@ -49,6 +49,8 @@ Answer **yes** when Composer asks to activate the plugin. This will:
 1. Download `uv` (~10 MB) into `vendor/bin/`
 2. Create a Python virtual environment in `vendor/bin/python-in-php/`
 3. Generate PHPDoc stubs for installed packages in `py/`
+
+⭐️ Please star the repository to show that there is demand for it, so that you can be sure it will continue to be maintained
 
 ## Quick start
 
@@ -106,14 +108,40 @@ composer pip uninstall requests
 composer pip install --upgrade numpy
 ```
 
-Installed packages and their sources are saved to `composer.json` under `extra.python-in-php.packages` and are re-installed automatically on the next `composer install`.
+Installed packages and their sources are saved to `composer.json` under `extra.python-in-php.packages` with an approximate constraint (e.g. `^2.32.3`), while the exact resolved versions are pinned in `python-in-php.lock` next to `composer.lock`. On the next `composer install` packages are re-installed exactly from the lock file; without it they are resolved from the `composer.json` constraints and the lock file is created. **Commit `python-in-php.lock` to version control** to get reproducible installs across machines.
+
+`composer pip install --upgrade` re-resolves versions within the `composer.json` constraints and updates only the lock file, mirroring how `composer update` treats PHP packages.
+
+### Running Python
+
+The `composer python` command runs the project's Python interpreter (the one with your
+installed packages), runs `.py` scripts, and manages the Python version:
+
+```bash
+# Run a script
+composer python path/to/script.py arg1 arg2
+
+# Run a one-liner
+composer python -c "import numpy; print(numpy.__version__)"
+
+# Show the current Python version
+composer python use
+
+# Switch the Python version (recreates the environment and reinstalls packages)
+composer python use 3.12
+```
+
+The script's exit code is propagated. Note that `--version`/`-V` is intercepted by Composer
+itself — use `composer python use` to see the managed version, or `composer python -c "import sys; print(sys.version)"`.
 
 ### PyTorch GPU backends
 
 `composer pip install torch` picks the right PyTorch build for your hardware automatically:
 
-- **NVIDIA (CUDA), AMD (ROCm), Intel (XPU)** — on Linux and Windows the install runs with uv's `--torch-backend=auto`, which detects the GPU and driver and selects the matching wheel index (e.g. `cu130`, `rocm7.2`).
-- **Apple (MPS)** — on macOS the standard PyPI wheels already include Metal/MPS support, so no index override is applied.
+- CUDA for NVIDIA
+- ROCm for AMD
+- Metal for Apple Silicon
+- CPU backend when no GPU is present
 
 To force a specific backend, set the `PYTHON_IN_PHP_TORCH_BACKEND` environment variable (e.g. `cpu`, `cu128`, `rocm7.2`, or `none` to disable the default) or pass `--torch-backend=...` explicitly:
 
@@ -123,7 +151,7 @@ PYTHON_IN_PHP_TORCH_BACKEND=cpu composer pip install torch
 
 ## Configuration
 
-Configure Python-in-PHP in `composer.json`:
+In addition to the `composer pip` commands you can configure Python-in-PHP manually in `composer.json`:
 
 ```json
 {
@@ -135,8 +163,8 @@ Configure Python-in-PHP in `composer.json`:
                 {"name": "numpy",    "version": "^1.24"},
                 {
                     "name":      "torch",
-                    "version":   "2.7.0+rocm6.3",
-                    "index-url": "https://download.pytorch.org/whl/rocm6.3"
+                    "version":   "2.13.0+rocm7.2",
+                    "index-url": "https://download.pytorch.org/whl/rocm7.2"
                 },
                 {
                     "name":    "my-local-lib",
@@ -154,7 +182,7 @@ Configure Python-in-PHP in `composer.json`:
 | `python-version` | string | `"3.12"` | Python version to install |
 | `packages` | array | `[]` | List of packages to install |
 | `packages[].name` | string | — | Package name |
-| `packages[].version` | string | `"*"` | Version constraint (PEP 440 or `*`) |
+| `packages[].version` | string | `"*"` | Version constraint (Composer-style `^`/`~`, PEP 440 or `*`) |
 | `packages[].index-url` | string | — | Custom PyPI index URL for this package |
 | `packages[].path` | string | — | Absolute path to a local package directory |
 
@@ -172,6 +200,21 @@ $data = $response->json();  // method call
 echo $response->status_code; // attribute access
 ```
 
+### Python core from PHP
+
+The `Py` facade exposes Python's `exec`/`eval` and its builtins directly — useful for the
+things PHP has no equivalent for, or handles differently. It starts the Python worker
+automatically on first use.
+
+```php
+Py::eval('2 ** 10');                    // 1024
+Py::sum([1, 2, 3]);                     // 6  (Python sum(), not array_sum)
+Py::sorted([3, 1, 2], reverse: true);   // [3, 2, 1]  — PHP named args become Python kwargs
+Py::builtin('pow', 2, 8);               // 256  — call any builtin by name
+```
+
+See **[docs/usage.md](./docs/usage.md#python-builtins--running-code-from-php)** for the full list of helpers.
+
 ### Context managers
 
 Use `Py::with()` to run code inside a Python context manager — the equivalent of
@@ -182,12 +225,6 @@ throws.
 <?php
 
 use py\builtins;
-
-// with file:
-$file = builtins::open('/tmp/data.txt', 'w');
-Py::with($file, function () use ($file) {
-    $file->write('hello');
-});
 
 // with open(...) as f:  — the callback receives the entered value
 Py::with(builtins::open('/tmp/data.txt', 'a'), function ($f) {
@@ -330,6 +367,10 @@ Then set the `UV_BIN` env variable or ensure `uv` is in your `PATH`.
 **"Class py\xxx not found"**
 
 PHPDoc stubs are generated in `vendor/syncfly/python-in-php/py/`. Run `composer install` to regenerate them after adding new packages.
+
+**"Could not import: …" during stub generation**
+
+Some modules can't be imported while their stubs are generated. Expected cases — optional modules that aren't installed, or platform-only modules on the wrong OS — are hidden; the remaining ones are summarized on a single line. Re-run with `-v` (e.g. `composer install -v`) to see the full error for each module.
 
 **"Python script was not found"**
 

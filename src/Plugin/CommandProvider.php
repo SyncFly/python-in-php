@@ -15,6 +15,7 @@ class CommandProvider implements CommandProviderCapability
     {
         return [
             new PipCommand(),
+            new PythonCommand(),
         ];
     }
 }

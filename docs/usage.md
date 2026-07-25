@@ -23,6 +23,8 @@ libraries in PHP feels natural.
 | `obj[i] = v` | `$obj[$i] = $v` | `__setitem__` |
 | `len(obj)` | `count($obj)` | `__len__` |
 | `str(obj)` | `(string)$obj` | `__str__` |
+| `sum(x)` | `Py::sum($x)` | Python builtin ([facade](#python-builtins--running-code-from-php)) |
+| `sorted(x, reverse=True)` | `Py::sorted($x, reverse: true)` | Python builtin |
 | `for x in obj:` | `foreach ($obj as $x)` | Iteration |
 | `None` | `null` | |
 | `True` / `False` | `true` / `false` | |
@@ -345,6 +347,14 @@ builtins::_list([1, 2, 3]);
 builtins::_print("hello");
 ```
 
+For builtins the `Py` facade is usually cleaner — it keeps the Python names as-is, since PHP
+allows reserved words as method names:
+
+```php
+Py::list([1, 2, 3]);
+Py::print("hello");
+```
+
 Python names that start with `_` (private by convention) are not included in the generated
 stubs, but you can still access them at runtime via `$obj->_name`.
 
@@ -400,9 +410,99 @@ try {
 
 ---
 
+## Python builtins & running code from PHP
+
+The `Py` facade gives you Python's core directly from PHP. It **starts the Python worker
+automatically on first use** — you never need to call `Py::startIfNotStarted()` first.
+
+```php
+Py::eval('2 ** 10');                 // 1024 — evaluate an expression, return the result
+Py::exec('x = 1 + 1');               // run statements, returns null
+$np = Py::import('numpy');           // import a module as a PythonObject
+```
+
+Python's builtins are exposed as static methods. These are handy when PHP has no equivalent,
+or when its equivalent behaves differently — Python's builtins work on any Python iterable or
+`PythonObject`, not just PHP arrays:
+
+```php
+Py::sum([1, 2, 3]);                  // 6   (Python sum(), with an optional start)
+Py::sum([1, 2, 3], 10);              // 16
+Py::len($obj);                       // len(obj) — works on any Python object
+Py::min([3, 1, 2]);                  // 1
+Py::max([3, 1, 2]);                  // 3
+
+// PHP named arguments become Python keyword arguments:
+Py::sorted([3, 1, 2], reverse: true);   // [3, 2, 1]
+
+// range() returns a Python object; materialise it with list():
+$r = Py::range(5);                   // range object (PythonObject)
+Py::list($r);                        // [0, 1, 2, 3, 4]
+```
+
+Any builtin can also be called by name with `Py::builtin()` — the escape hatch that follows
+the same rule (positional PHP args → Python positional args, PHP named args → Python kwargs):
+
+```php
+Py::builtin('pow', 2, 8);            // 256
+Py::builtin('sorted', [3, 1, 2], reverse: true);  // [3, 2, 1]
+```
+
+### Operators
+
+PHP's operators don't work on Python objects (numpy arrays, lists, sets, objects with a custom
+`__add__`, …) and behave differently even where they exist — `+` concatenates Python lists
+instead of unioning, `*` repeats a sequence, `//` and `%` floor toward negative infinity, and
+`@` (matrix multiply) has no PHP equivalent at all. `Py` exposes the real Python operator:
+
+```php
+Py::plus([1, 2], [3, 4]);   // [1, 2, 3, 4]  — list concatenation (PHP "+" would union)
+Py::times([1, 2], 3);       // [1, 2, 1, 2, 1, 2]  — sequence repetition
+Py::floorDivide(-7, 2);     // -4  (PHP intdiv(-7, 2) is -3)
+Py::modulo(-7, 3);          // 2   (PHP -7 % 3 is -1)
+Py::plus('a', 'b');         // 'ab'
+Py::matmul($matrixA, $matrixB);   // A @ B
+Py::contains([1, 2, 3], 2); // true — Python's "in"
+
+Py::operator('add', 10, 5); // 15  — any operator by its Python `operator`-module name
+```
+
+For a whole infix expression, pass alternating operands and operator symbols to `Py::expr()`.
+It applies Python precedence (so `*` binds tighter than `+`, and `**` is right-associative)
+and keeps intermediate results on the Python side:
+
+```php
+Py::expr(1, '+', 6, '*', 2);          // 13  (not 14)
+Py::expr($numpy1, '+', $numpy2, '*', 2);   // element-wise: a + b * 2
+Py::expr(2, '**', 3, '**', 2);        // 512 (right-associative)
+```
+
+Supported symbols: `**`, `*`, `@`, `/`, `//`, `%`, `+`, `-`, `<<`, `>>`, `&`, `^`, `|`,
+`==`, `!=`, `<`, `<=`, `>`, `>=`. (`Py::expression()` is an alias.)
+
+Available named helpers:
+
+| Group | Methods |
+|-------|---------|
+| Code / modules | `exec`, `eval`, `import`, `builtin` |
+| Aggregation & iterables | `len`, `sum`, `min`, `max`, `sorted`, `reversed`, `enumerate`, `zip`, `map`, `filter`, `range`, `iter`, `next`, `any`, `all` |
+| Math | `abs`, `round`, `pow`, `divmod` |
+| Constructors & conversions | `list`, `dict`, `set`, `tuple`, `frozenset`, `str`, `int`, `float`, `bool`, `bytes` |
+| Introspection | `repr`, `type`, `isinstance`, `hasattr`, `getattr`, `setattr`, `callable`, `hash`, `id`, `dir` |
+| Chars & formatting | `chr`, `ord`, `hex`, `oct`, `bin`, `format` |
+| I/O | `print`, `open` |
+| Arithmetic operators | `plus`, `minus`, `times`, `divide`, `floorDivide`, `modulo`, `power`, `matmul`, `negative`, `positive` |
+| Bitwise operators | `bitAnd`, `bitOr`, `bitXor`, `bitNot`, `leftShift`, `rightShift` |
+| Comparison / membership | `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `contains`, `operator` |
+| Infix expressions | `expr`, `expression` |
+
+---
+
 ## Low-level bridge API
 
-For cases where the generated stubs aren't enough, you can use `PythonBridge` directly:
+For cases where the generated stubs aren't enough, you can use `PythonBridge` directly.
+The `Py::eval`, `Py::exec`, `Py::import` and `Py::call` helpers above are convenient,
+auto-starting wrappers over these same calls.
 
 ```php
 use Python_In_PHP\PythonBridge;

@@ -6,6 +6,7 @@
 /py
 /python_bin
 /fixtures/project/vendor/
+fixtures/project/composer.lock
 composer.lock
 __pycache__
 .phpunit.result.cache

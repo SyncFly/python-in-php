@@ -10,6 +10,7 @@ class Package
         public bool $from_included_package = false,
         public ?string $index_url = null,
         public ?string $path = null,
+        public ?string $locked_version = null,
     ){
 
     }
@@ -55,14 +56,49 @@ class Package
     }
 
     /**
-     * Returns the pip install specifier: the local path if set, otherwise name+version.
-     * Path packages are reinstalled from their original location rather than by name/version.
+     * Returns the pip install specifier: the local path if set, the exact locked pin next,
+     * otherwise name+constraint. Path packages are reinstalled from their original location.
      */
     public function getInstallSpec(): string
     {
         if ($this->path !== null) {
             return $this->path;
         }
+        if ($this->locked_version !== null) {
+            return $this->name . '==' . $this->locked_version;
+        }
         return $this->name . $this->version->convertToPip();
+    }
+
+    /** Lock file entry with the exact pin, or null when there is nothing to pin. */
+    public function toLockArray(): ?array
+    {
+        if ($this->name === null || $this->locked_version === null) {
+            return null;
+        }
+        return ['name' => $this->name, 'version' => $this->locked_version];
+    }
+
+    /** Best-effort check that the locked pin still satisfies the composer.json constraint. */
+    public function satisfiesConstraint(): bool
+    {
+        if ($this->locked_version === null || $this->version === null) {
+            return true;
+        }
+        $constraint = trim($this->version->toString());
+        if ($constraint === '' || $constraint === '*') {
+            return true;
+        }
+        // The machine-specific local segment ("+cu126") never takes part in constraint checks
+        $pin = explode('+', $this->locked_version)[0];
+        if (!class_exists(\Composer\Semver\Semver::class)) {
+            return true;
+        }
+        try {
+            return \Composer\Semver\Semver::satisfies($pin, $constraint);
+        } catch (\Throwable) {
+            // Constraints composer's parser can't read (e.g. "~=1.2") are trusted as satisfied
+            return true;
+        }
     }
 }

@@ -1,0 +1,26 @@
+{
+    "_readme": "This file locks the Python packages of your project to known versions. Commit it to version control.",
+    "python-version": "3.12",
+    "packages": [
+        {
+            "name": "numpy",
+            "version": "2.4.6"
+        },
+        {
+            "name": "requests",
+            "version": "2.34.2"
+        },
+        {
+            "name": "setuptools",
+            "version": "83.0.0"
+        },
+        {
+            "name": "websockets",
+            "version": "16.1"
+        },
+        {
+            "name": "wheel",
+            "version": "0.47.0"
+        }
+    ]
+}

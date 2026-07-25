@@ -69,12 +69,7 @@ class UvPythonEnvironmentService
         unlink($target);
     }
 
-    /**
-     * GPU support (notably ROCm auto-detection and current CUDA/ROCm indexes for
-     * --torch-backend=auto) depends on the uv release, so an existing binary older
-     * than $uv_version is re-downloaded. If the version cannot be determined, the
-     * existing binary is kept.
-     */
+    /** A binary older than $uv_version is re-downloaded: GPU support of --torch-backend=auto depends on the uv release. */
     private function isUvOutdated(string $uv_bin): bool
     {
         $result = $this->runCommand(escapeshellarg($uv_bin) . ' --version');

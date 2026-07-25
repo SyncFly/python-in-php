@@ -31,4 +31,10 @@ class Utils
         }
         return false;
     }
+
+    /** PEP 503 name normalisation: lowercase, with runs of "-", "_" and "." collapsed to "-". */
+    public static function normalizePackageName(string $name): string
+    {
+        return strtolower((string) preg_replace('/[-_.]+/', '-', trim($name)));
+    }
 }
