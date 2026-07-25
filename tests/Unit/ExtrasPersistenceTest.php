@@ -90,6 +90,22 @@ test('the install spec includes the extras', function () {
     expect($unpinned->getInstallSpec())->toBe('somepackage[geoip,cli]>=1.2.0,<2.0.0');
 });
 
+test('a legacy "name[extra]" entry is migrated to a clean name plus extras', function () {
+    $package = Package::fromArray(['name' => 'cloakbrowser[geoip]', 'version' => '0.4.8']);
+
+    expect($package->name)->toBe('cloakbrowser');
+    expect($package->extras)->toBe(['geoip']);
+    expect($package->getInstallSpec())->toBe('cloakbrowser[geoip]==0.4.8');
+});
+
+test('a legacy bracketed entry is still recognized in the user command', function () {
+    $manager = managerWithProject(new Project());
+    $package = Package::fromArray(['name' => 'cloakbrowser[geoip]', 'version' => '0.4.8']);
+
+    // A stale stored spec must not be appended next to the user's request (uv conflict)
+    expect($manager->commandIncludesPackage(['install', 'cloakbrowser[geoip]==0.5.2', '--upgrade'], $package))->toBeTrue();
+});
+
 test('extras round-trip through the composer.json array form', function () {
     $package = new Package('somepackage', new PackageVersion('^1.2.0'), extras: ['geoip']);
 

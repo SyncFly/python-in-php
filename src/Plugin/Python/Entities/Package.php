@@ -23,12 +23,19 @@ class Package
             $extras = array_map('trim', explode(',', $extras));
         }
 
+        // A legacy "name[extra]" entry is split into the clean name and its extras
+        $name = $package['name'] ?? null;
+        if (is_string($name) && preg_match('/^([^\[]+)\[([^\]]*)\]$/', trim($name), $m)) {
+            $name = trim($m[1]);
+            $extras = $extras ?: array_filter(array_map('trim', explode(',', $m[2])));
+        }
+
         return new self(
-            $package['name'] ?? null,
+            $name,
             isset($package['version']) ? new PackageVersion($package['version']) : new PackageVersion("*"),
             index_url: $package['index-url'] ?? null,
             path: $package['path'] ?? null,
-            extras: $extras ?: null,
+            extras: array_values((array) $extras) ?: null,
         );
     }
 

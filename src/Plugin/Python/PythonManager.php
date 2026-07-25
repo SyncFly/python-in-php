@@ -72,14 +72,11 @@ class PythonManager
         if ($command[0] == 'install') {
             $this->handleInstall($command);
         }
-        if ($command[0] == 'uninstall') {
+        elseif ($command[0] == 'uninstall') {
             $this->handleUninstall($command);
         }
-        elseif (in_array($command[0], ['list', 'show', 'tree', 'check'])) {
-            $this->handleOthers($command);
-        }
         else {
-            $result = $this->python_service->executePipCommand($this->project, $command);
+            $this->handleOthers($command);
         }
     }
 
@@ -215,14 +212,20 @@ class PythonManager
         // Extras/specifiers requested for an already-satisfied package must be persisted
         // too, even though uv reported no install for it
         if ($user_command !== [] && ($result['code'] ?? 1) === 0) {
+            $is_upgrade = in_array('--upgrade', $user_command);
             foreach ($this->project->getPackages() as $package) {
                 $requested_extras = $this->extractRequestedExtras($user_command, $package);
                 if ($requested_extras !== null) {
                     $package->extras = $requested_extras;
                 }
-                $specifier = $this->extractRequestedConstraint($user_command, $package);
+                $specifier = $is_upgrade ? null : $this->extractRequestedConstraint($user_command, $package);
                 if ($specifier !== null) {
                     $package->version = new PackageVersion($specifier);
+                }
+                // A requested package whose kept pin no longer fits the constraint widens it
+                if ($package->locked_version !== null && !$package->satisfiesConstraint()
+                    && $this->commandIncludesPackage($user_command, $package)) {
+                    $package->version = $this->approximateConstraint($package->locked_version);
                 }
             }
         }
@@ -233,7 +236,10 @@ class PythonManager
     /** The composer.json constraint for a persisted package: explicit specifier > kept constraint > caret of the pin. */
     private function resolveConstraint(Package $package, ?Package $existing, array $user_command, string $exact): PackageVersion
     {
-        $specifier = $this->extractRequestedConstraint($user_command, $package);
+        // With --upgrade a specifier is a one-time target for uv, not a constraint to persist
+        $specifier = in_array('--upgrade', $user_command)
+            ? null
+            : $this->extractRequestedConstraint($user_command, $package);
         if ($specifier !== null) {
             return new PackageVersion($specifier);
         }
@@ -517,13 +523,24 @@ class PythonManager
         if ($package->name === null) {
             return false;
         }
-        $name = preg_quote($package->name, '/');
-        $name = str_replace(['\-', '\_', '-', '_'], '.', $name);
-        $pattern = '/\b' . $name . '\b/';
+        $target = $this->normalizePackageName((string) $this->requirementName($package->name));
         foreach ($command as $part) {
-            if (preg_match($pattern, $part)) return true;
+            $part = trim((string) $part, "\"'");
+            if ($part === '' || str_starts_with($part, '-')) {
+                continue;
+            }
+            $name = $this->requirementName($part);
+            if ($name !== null && $this->normalizePackageName($name) === $target) {
+                return true;
+            }
         }
         return false;
+    }
+
+    /** The distribution name at the start of a pip requirement ("pkg[extra]==1.0" -> "pkg"), or null. */
+    private function requirementName(string $part): ?string
+    {
+        return preg_match('/^\s*([A-Za-z0-9][A-Za-z0-9._-]*)/', $part, $m) ? $m[1] : null;
     }
 
     public function commandIncludes(array $command, string $text): bool

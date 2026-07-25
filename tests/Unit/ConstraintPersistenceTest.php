@@ -59,6 +59,51 @@ test('an existing constraint survives an upgrade within it', function () {
     expect(lockedVersion($project, 'requests'))->toBe('2.32.3');
 });
 
+test('an upgrade with an explicit specifier does not pin composer.json', function () {
+    $project = new Project();
+    $project->addPackage(new Package('cloakbrowser', new PackageVersion('==0.4.8'), extras: ['geoip'], locked_version: '0.4.8'));
+    $manager = managerWithProject($project);
+
+    persistInstalled($manager, ['install', 'cloakbrowser[geoip]==0.5.2', '--upgrade'], " + cloakbrowser==0.5.2\n");
+
+    expect(savedVersion($project, 'cloakbrowser'))->toBe('^0.5.2');
+    expect(lockedVersion($project, 'cloakbrowser'))->toBe('0.5.2');
+    expect(savedExtras($project, 'cloakbrowser'))->toBe(['geoip']);
+});
+
+test('an upgrade install of a new package stores a caret constraint', function () {
+    $project = new Project();
+    $manager = managerWithProject($project);
+
+    persistInstalled($manager, ['install', 'requests==2.31.0', '--upgrade'], " + requests==2.31.0\n");
+
+    expect(savedVersion($project, 'requests'))->toBe('^2.31.0');
+    expect(lockedVersion($project, 'requests'))->toBe('2.31.0');
+});
+
+test('an upgrade to a version inside the constraint keeps the constraint', function () {
+    $project = new Project();
+    $project->addPackage(new Package('numpy', new PackageVersion('^1.24'), locked_version: '1.26.0'));
+    $manager = managerWithProject($project);
+
+    persistInstalled($manager, ['install', 'numpy==1.26.4', '--upgrade'], " + numpy==1.26.4\n");
+
+    expect(savedVersion($project, 'numpy'))->toBe('^1.24');
+    expect(lockedVersion($project, 'numpy'))->toBe('1.26.4');
+});
+
+test('an upgrade of an already-satisfied package outside the constraint widens it', function () {
+    $project = new Project();
+    $project->addPackage(new Package('requests', new PackageVersion('2.33.0'), extras: ['socks'], locked_version: '2.34.2'));
+    $manager = managerWithProject($project);
+
+    // The package is already at the requested version, so uv reports no install
+    persistInstalled($manager, ['install', 'requests[socks]==2.34.2', '--upgrade'], "Audited 1 package\n");
+
+    expect(savedVersion($project, 'requests'))->toBe('^2.34.2');
+    expect(lockedVersion($project, 'requests'))->toBe('2.34.2');
+});
+
 test('an explicit request outside the old constraint widens it to a caret', function () {
     $project = new Project();
     $project->addPackage(new Package('requests', new PackageVersion('^1.0'), locked_version: '1.2.0'));
