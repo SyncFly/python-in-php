@@ -99,7 +99,7 @@ class PythonManager
                     && $package->index_url === null && $package->path === null) {
                     // --upgrade resolves anew within the constraint instead of reinstalling the pin
                     $command[] = in_array('--upgrade', $command)
-                        ? $package->name . $package->version->convertToPip()
+                        ? $package->getNameWithExtras() . $package->version->convertToPip()
                         : $package->getInstallSpec();
                 }
             }
@@ -171,9 +171,16 @@ class PythonManager
                 $existing           = $existing_packages[$package->getKey()];
                 $package->index_url = $existing->index_url;
                 $package->path      = $existing->path;
+                $package->extras    = $existing->extras;
                 $package->from_included_package = $existing->from_included_package && !$is_requested;
             } elseif ($command_index_url !== null && $is_requested) {
                 $package->index_url = $command_index_url;
+            }
+
+            // Extras requested by the user ("somepackage[geoip]") replace the stored ones
+            $requested_extras = $this->extractRequestedExtras($user_command ?: $command, $package);
+            if ($requested_extras !== null) {
+                $package->extras = $requested_extras;
             }
 
             // Keep the path so the package reinstalls from source
@@ -203,6 +210,21 @@ class PythonManager
             $path_package = new Package(path: $command_path);
             $this->project->addPackage($path_package);
             $packages_to_refresh[] = $path_package;
+        }
+
+        // Extras/specifiers requested for an already-satisfied package must be persisted
+        // too, even though uv reported no install for it
+        if ($user_command !== [] && ($result['code'] ?? 1) === 0) {
+            foreach ($this->project->getPackages() as $package) {
+                $requested_extras = $this->extractRequestedExtras($user_command, $package);
+                if ($requested_extras !== null) {
+                    $package->extras = $requested_extras;
+                }
+                $specifier = $this->extractRequestedConstraint($user_command, $package);
+                if ($specifier !== null) {
+                    $package->version = new PackageVersion($specifier);
+                }
+            }
         }
 
         return $packages_to_refresh;
@@ -243,12 +265,32 @@ class PythonManager
         }
         foreach ($command as $part) {
             $part = trim((string) $part, "\"'");
-            if (!preg_match('/^([A-Za-z0-9._-]+)((?:===|==|~=|!=|>=|<=|>|<).*)$/', $part, $m)) {
+            if (!preg_match('/^([A-Za-z0-9._-]+)(?:\[[^\]]*\])?((?:===|==|~=|!=|>=|<=|>|<).*)$/', $part, $m)) {
                 continue;
             }
             if ($this->normalizePackageName($m[1]) === $this->normalizePackageName($package->name)) {
                 return trim($m[2]);
             }
+        }
+        return null;
+    }
+
+    /** The extras the user typed for this package (e.g. ["socks"] from "requests[socks]"), or null. */
+    private function extractRequestedExtras(array $command, Package $package): ?array
+    {
+        if ($package->name === null) {
+            return null;
+        }
+        foreach ($command as $part) {
+            $part = trim((string) $part, "\"'");
+            if (!preg_match('/^([A-Za-z0-9._-]+)\[([^\]]*)\]/', $part, $m)) {
+                continue;
+            }
+            if ($this->normalizePackageName($m[1]) !== $this->normalizePackageName($package->name)) {
+                continue;
+            }
+            $extras = array_values(array_filter(array_map('trim', explode(',', $m[2]))));
+            return $extras ?: null;
         }
         return null;
     }

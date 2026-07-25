@@ -11,17 +11,24 @@ class Package
         public ?string $index_url = null,
         public ?string $path = null,
         public ?string $locked_version = null,
+        public ?array $extras = null,
     ){
 
     }
 
     public static function fromArray(array $package): self
     {
+        $extras = $package['extras'] ?? null;
+        if (is_string($extras)) {
+            $extras = array_map('trim', explode(',', $extras));
+        }
+
         return new self(
             $package['name'] ?? null,
             isset($package['version']) ? new PackageVersion($package['version']) : new PackageVersion("*"),
             index_url: $package['index-url'] ?? null,
             path: $package['path'] ?? null,
+            extras: $extras ?: null,
         );
     }
 
@@ -34,6 +41,9 @@ class Package
         }
 
         $result = ['name' => $this->name, 'version' => $this->version->toString()];
+        if (!empty($this->extras)) {
+            $result['extras'] = array_values($this->extras);
+        }
         if ($this->index_url !== null) {
             $result['index-url'] = $this->index_url;
         }
@@ -55,6 +65,12 @@ class Package
         return $this->name ?? $this->path ?? '';
     }
 
+    /** The pip requirement name including the extras suffix ("requests[socks]") when extras are set. */
+    public function getNameWithExtras(): string
+    {
+        return $this->name . (empty($this->extras) ? '' : '[' . implode(',', $this->extras) . ']');
+    }
+
     /**
      * Returns the pip install specifier: the local path if set, the exact locked pin next,
      * otherwise name+constraint. Path packages are reinstalled from their original location.
@@ -65,9 +81,9 @@ class Package
             return $this->path;
         }
         if ($this->locked_version !== null) {
-            return $this->name . '==' . $this->locked_version;
+            return $this->getNameWithExtras() . '==' . $this->locked_version;
         }
-        return $this->name . $this->version->convertToPip();
+        return $this->getNameWithExtras() . $this->version->convertToPip();
     }
 
     /** Lock file entry with the exact pin, or null when there is nothing to pin. */

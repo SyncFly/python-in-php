@@ -44,7 +44,7 @@ class UvService
     public function updatePackage(Package $package, Project $project): array
     {
         // An upgrade resolves anew within the constraint instead of reinstalling the exact pin
-        $spec = $package->path !== null ? $package->path : $package->name . $package->version->convertToPip();
+        $spec = $package->path !== null ? $package->path : $package->getNameWithExtras() . $package->version->convertToPip();
         $args = ['install', '--upgrade', $spec];
 
         if ($package->index_url !== null) {

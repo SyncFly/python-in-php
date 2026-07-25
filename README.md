@@ -94,6 +94,9 @@ composer pip install requests
 # Install a specific version
 composer pip install "numpy:^1.24"
 
+# Install with extras
+composer pip install "requests[socks]"
+
 # Install with a custom PyPI index
 # (for PyTorch the right GPU index is normally picked automatically — see below)
 composer pip install torch --index-url https://download.pytorch.org/whl/rocm6.3
@@ -183,6 +186,7 @@ In addition to the `composer pip` commands you can configure Python-in-PHP manua
 | `packages` | array | `[]` | List of packages to install |
 | `packages[].name` | string | — | Package name |
 | `packages[].version` | string | `"*"` | Version constraint (Composer-style `^`/`~`, PEP 440 or `*`) |
+| `packages[].extras` | array | — | Package extras to install (the `name[extra]` pip syntax) |
 | `packages[].index-url` | string | — | Custom PyPI index URL for this package |
 | `packages[].path` | string | — | Absolute path to a local package directory |
 
