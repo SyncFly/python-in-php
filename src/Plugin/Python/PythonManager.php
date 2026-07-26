@@ -128,7 +128,10 @@ class PythonManager
             $this->persistInstalledPackages($command, $result, $command_index_url, $command_path, $user_command)
         );
 
-        $this->captureMissingPins();
+        if (($result['code'] ?? 1) === 0) {
+            $this->syncPinsWithEnvironment();
+        }
+        $this->reconcileRequestedConstraints($user_command);
 
         $this->saveProject();
 
@@ -222,11 +225,6 @@ class PythonManager
                 if ($specifier !== null) {
                     $package->version = new PackageVersion($specifier);
                 }
-                // A requested package whose kept pin no longer fits the constraint widens it
-                if ($package->locked_version !== null && !$package->satisfiesConstraint()
-                    && $this->commandIncludesPackage($user_command, $package)) {
-                    $package->version = $this->approximateConstraint($package->locked_version);
-                }
             }
         }
 
@@ -316,14 +314,14 @@ class PythonManager
         }
     }
 
-    /** Fills lock pins for tracked packages already present in the environment, so uv reported no install for them. */
-    private function captureMissingPins(): void
+    /**
+     * Aligns the lock pins of all tracked packages with the environment: uv reports versions
+     * only when it changes them, so after an interrupted run the records drift silently.
+     */
+    private function syncPinsWithEnvironment(): void
     {
-        $missing = array_filter(
-            $this->project->getPackages(),
-            fn($package) => $package->name !== null && $package->locked_version === null
-        );
-        if ($missing === []) {
+        $named = array_filter($this->project->getPackages(), fn($package) => $package->name !== null);
+        if ($named === []) {
             return;
         }
 
@@ -339,15 +337,34 @@ class PythonManager
             }
         }
 
-        foreach ($missing as $package) {
+        foreach ($named as $package) {
             $version = $installed[$this->normalizePackageName($package->name)] ?? null;
             if ($version === null) {
+                continue;
+            }
+            $public = $this->stripLocalVersion($version);
+            // A pin that already matches the environment keeps its local-segment decision
+            if ($package->locked_version !== null && $this->stripLocalVersion($package->locked_version) === $public) {
                 continue;
             }
             // The machine-specific GPU segment is only kept when the source or the constraint pins it
             $keep_local = $package->index_url !== null || $package->path !== null
                 || str_contains($package->version->toString(), '+');
-            $package->locked_version = $keep_local ? $version : $this->stripLocalVersion($version);
+            $package->locked_version = $keep_local ? $version : $public;
+        }
+    }
+
+    /** Widens the constraints of user-requested packages whose pin no longer fits, so the pin survives the next load. */
+    private function reconcileRequestedConstraints(array $user_command): void
+    {
+        if ($user_command === []) {
+            return;
+        }
+        foreach ($this->project->getPackages() as $package) {
+            if ($package->locked_version !== null && !$package->satisfiesConstraint()
+                && $this->commandIncludesPackage($user_command, $package)) {
+                $package->version = $this->approximateConstraint($package->locked_version);
+            }
         }
     }
 

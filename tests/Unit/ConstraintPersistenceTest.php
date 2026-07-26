@@ -99,6 +99,7 @@ test('an upgrade of an already-satisfied package outside the constraint widens i
 
     // The package is already at the requested version, so uv reports no install
     persistInstalled($manager, ['install', 'requests[socks]==2.34.2', '--upgrade'], "Audited 1 package\n");
+    reconcileConstraints($manager, ['install', 'requests[socks]==2.34.2', '--upgrade']);
 
     expect(savedVersion($project, 'requests'))->toBe('^2.34.2');
     expect(lockedVersion($project, 'requests'))->toBe('2.34.2');
