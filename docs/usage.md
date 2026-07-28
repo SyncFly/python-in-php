@@ -329,33 +329,14 @@ echo $d['a'];   // 1 — plain array, no wrapper
 
 ---
 
-## Naming conflicts
+## Naming nuances
 
-A few Python names are reserved words in PHP (`list`, `match`, `default`, …). The generated
-stubs prefix them with an underscore:
+1. The underscore prefix appears in generated *class* names, where PHP does forbid
+reserved words: the stub for Python's `list` class is declared as `py\builtins\_list`,
+since `class list` would not parse. These prefixed names only show up in class stub files and
+PHPDoc type hints — never in call syntax.
 
-```python
-# Python
-builtins.list([1, 2, 3])
-builtins.print("hello")
-```
-
-```php
-// PHP
-use py\builtins;
-builtins::_list([1, 2, 3]);
-builtins::_print("hello");
-```
-
-For builtins the `Py` facade is usually cleaner — it keeps the Python names as-is, since PHP
-allows reserved words as method names:
-
-```php
-Py::list([1, 2, 3]);
-Py::print("hello");
-```
-
-Python names that start with `_` (private by convention) are not included in the generated
+2. Python names that start with `_` (private by convention) are not included in the generated
 stubs, but you can still access them at runtime via `$obj->_name`.
 
 ---
@@ -370,14 +351,8 @@ with open("data.txt", "r") as f:
 
 ```php
 // PHP
-use Python_In_PHP\PythonBridge;
-
-$bridge = PythonBridge::startOrGetRunning();
-$file   = $bridge->eval("open('data.txt', 'r')");
-
-$content = $bridge->with($file->getObjectId(), function () use ($file) {
-    return $file->read();
-    // __exit__ is called automatically here, even if an exception is thrown
+Py::with(builtins::open('data.txt', 'r'), function ($f) {
+    $content = $f->read();
 });
 ```
 

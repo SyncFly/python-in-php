@@ -24,12 +24,19 @@ class PhpDocGeneratorService
     private PythonObject $pkgutil;
 
     private string $namespace = 'py';
+    // Mirrors KNOWN_BROKEN_MODULES in module_inspector.py for top-level names.
     private array $excluded_modules = [
         'idlelib',
-        'antigravity'
+        'antigravity',
+        'this',
+        'turtledemo',
+        'lib2to3',
+        'distutils'
     ];
 
     private array $importErrors = [];
+    // Top-level module names that belong to the user's explicitly installed packages.
+    private array $user_installed_modules = [];
 
     function __construct(
         private string $dir,
@@ -89,33 +96,63 @@ class PhpDocGeneratorService
     }
 
     /**
-     * -v shows every import error in full; otherwise expected noise (missing modules,
-     * platform-only stubs) is dropped and real failures are listed compactly by name.
+     * Failures in the user's explicitly installed packages are actionable: listed by name,
+     * full errors at -v. Everything else (stdlib, builtins) is reported as a count only,
+     * with full errors at -vv. Expected noise (missing modules, platform-only stubs) is
+     * dropped below -v.
      */
     private function reportImportErrors(): void
     {
         if (empty($this->importErrors)) return;
 
+        $installed = array_filter($this->importErrors, $this->isUserInstalledModule(...), ARRAY_FILTER_USE_KEY);
+        $other = array_diff_key($this->importErrors, $installed);
+        $real_other_count = count(array_filter($other, fn($error) => !$this->isIgnorableImportError($error)));
+
         if ($this->output->isVerbose()) {
-            foreach ($this->importErrors as $module => $error) {
+            foreach ($installed as $module => $error) {
                 $this->output->displayMessage("  ⚠️  $module: $error");
+            }
+            if ($this->output->isVeryVerbose()) {
+                foreach ($other as $module => $error) {
+                    $this->output->displayMessage("  ⚠️  $module: $error");
+                }
+            }
+            elseif ($real_other_count > 0) {
+                $this->reportNotInstalledCount($real_other_count);
             }
             return;
         }
 
-        $real_errors = array_filter($this->importErrors, fn($error) => !$this->isIgnorableImportError($error));
-        if (empty($real_errors)) return;
-
-        $modules = implode(', ', array_keys($real_errors));
-        $this->output->displayMessage("  ⚠️  Could not import: $modules", 1);
-        $this->output->displayMessage("  (run with -v for details)");
+        $real_installed = array_filter($installed, fn($error) => !$this->isIgnorableImportError($error));
+        if (!empty($real_installed)) {
+            $modules = implode(', ', array_keys($real_installed));
+            $this->output->displayMessage("  ⚠️  Could not import: $modules", 1);
+            $this->output->displayMessage("  (run with -v for details)");
+        }
+        if ($real_other_count > 0) {
+            $this->reportNotInstalledCount($real_other_count);
+        }
     }
 
-    /** Expected, non-actionable import failures: a module that isn't installed or a wrong-OS stub. */
+    private function reportNotInstalledCount(int $count): void
+    {
+        $counted = $count === 1 ? '1 module that is' : "$count modules that are";
+        $this->output->displayMessage("  ⚠️  Could not import $counted not explicitly installed (run with -vv for details)");
+    }
+
+    /** Whether the module (or its root package) came from the user's explicitly installed packages. */
+    private function isUserInstalledModule(string $module_name): bool
+    {
+        return in_array(explode('.', $module_name, 2)[0], $this->user_installed_modules);
+    }
+
+    /** Expected, non-actionable import failures: a module that isn't installed, a wrong-OS stub, or a deliberately skipped module. */
     private function isIgnorableImportError(string $error): bool
     {
         return str_contains($error, 'ModuleNotFoundError: No module named')
-            || str_contains($error, 'ImportError: win32 only');
+            || str_contains($error, 'ImportError: win32 only')
+            || str_contains($error, 'excluded by pattern');
     }
 
     public function refreshPhpDocsForAllModules(): void
@@ -196,6 +233,8 @@ class PhpDocGeneratorService
     {
         if (!Helpers::isIdentifier($name) || isset(Helpers::Keywords[strtolower($name)])) {
             $name = '_' . $name;
+            // Still invalid after prefixing (dotted alias, weird chars): can't become a PHP class — skip.
+            if (!Helpers::isIdentifier($name)) return;
         }
 
         $php_file = new PhpFile();
@@ -252,6 +291,7 @@ class PhpDocGeneratorService
         if (!empty($entity['attributes'])) {
             foreach ($entity['attributes'] as $property) {
                 $property_name = $property['name'];
+                if (!Helpers::isIdentifier($property_name)) continue;
                 $property_type = $this->convertType($property['type']);
                 $php_class->addProperty($property_name)->setStatic()->addComment("@var $property_type");
             }
@@ -267,8 +307,8 @@ class PhpDocGeneratorService
                 try {
                     yield from $this->processEntity($class_entities, $class_name, implode('\\', [$namespace, $name]), true);
                 }
-                catch (\Throwable $e) {
-                    echo $e . "\n";
+                catch (\Throwable) {
+                    // Skip the class; generation of the surrounding module continues.
                 }
             }
         }
@@ -347,6 +387,8 @@ class PhpDocGeneratorService
         // Match the sanitisation processEntity() applies to generated class names.
         if (!Helpers::isIdentifier($class) || isset(Helpers::Keywords[strtolower($class)])) {
             $class = '_' . $class;
+            // No stub is generated for such a name — fall back to the generic wrapper type.
+            if (!Helpers::isIdentifier($class)) return '\\' . PythonObject::class;
         }
 
         return '\\' . implode('\\', [$this->namespace, ...$parts, $class]);
@@ -454,6 +496,7 @@ class PhpDocGeneratorService
         if (!empty($package_names)) {
             $modules = [...$modules, ...$this->bridge->getModuleNamesInPackages($package_names)];
         }
+        $this->user_installed_modules = $modules;
         if ($include_builtin_modules) {
             $modules = [...$modules, ...$this->sys->stdlib_module_names];
         }

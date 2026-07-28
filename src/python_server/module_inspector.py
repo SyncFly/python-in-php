@@ -65,9 +65,32 @@ MODULES_TO_EXCLUDE = [
     r'\b_[a-zA-Z0-9_]*\b'
 ]
 
+# Known-broken imports: setup-time machinery, deprecated shims, wrong-OS codecs, import side effects.
+KNOWN_BROKEN_MODULES = [
+    'setuptools.command',
+    'setuptools.installer',
+    'setuptools.wheel',
+    'setuptools.sandbox',
+    'setuptools.msvc',
+    'pkg_resources.extern',
+    'encodings.mbcs',
+    'encodings.oem',
+    'encodings.cp65001',
+    'multiprocessing.popen_spawn_win32',
+    'asyncio.windows_events',
+    'asyncio.windows_utils',
+    'distutils',
+    'lib2to3',
+    'turtledemo',
+    'idlelib',
+    'antigravity',
+    'this',
+]
+
 class ModuleMock(MagicMock):
     def __init__(self, name: str, **kwargs):
-        super().__init__(name, **kwargs); self.__name__ = name; self.__file__ = f"__mock__/{name.replace('.', '/')}.py"; self.__path__ = [f"__mock__/{name.replace('.', '/')}",]; loader = importlib.machinery.SourceFileLoader(self.__name__, self.__file__); self.__spec__ = importlib.machinery.ModuleSpec(name=self.__name__, loader=loader, origin=self.__file__)
+        # name must go as a keyword: the first positional Mock argument is spec, which would restrict attributes and break imports like `matplotlib.pyplot.Figure`.
+        super().__init__(name=name, **kwargs); self.__name__ = name; self.__file__ = f"__mock__/{name.replace('.', '/')}.py"; self.__path__ = [f"__mock__/{name.replace('.', '/')}",]; loader = importlib.machinery.SourceFileLoader(self.__name__, self.__file__); self.__spec__ = importlib.machinery.ModuleSpec(name=self.__name__, loader=loader, origin=self.__file__)
 
 def _apply_gui_mocks():
     for module_name in GUI_MODULES_TO_MOCK: sys.modules[module_name] = ModuleMock(module_name)
@@ -76,6 +99,9 @@ def _is_module_excluded(module_name: str) -> bool:
     # Check whether any part of the path contains an initial underscore
     if any(part.startswith('_') and part != '__init__' for part in module_name.split('.')):
         return True
+    # Dot-aware prefix match so 'this' doesn't swallow e.g. 'thing'.
+    for known in KNOWN_BROKEN_MODULES:
+        if module_name == known or module_name.startswith(known + '.'): return True
     for pattern in MODULES_TO_EXCLUDE:
         if re.search(pattern, module_name): return True
     return False

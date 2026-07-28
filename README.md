@@ -25,7 +25,7 @@ The **Python-in-PHP** library allows you to easily use any Python packages as if
 <br/>
 You can run AI models with libraries like `transformers`, `torch`, `vllm`, `numpy`, etc. in your PHP project with PHP syntax.
 <br/>
-See **[syncfly/transformers-torch-php](https://github.com/SyncFly/transformers-torch-php)** for a quick start with `transformers` and `torch`.
+See [syncfly/transformers-torch-php](https://github.com/SyncFly/transformers-torch-php) for a quick start with `transformers` and `torch`.
 
 ## System requirements
 
@@ -137,22 +137,7 @@ composer python use 3.12
 The script's exit code is propagated. Note that `--version`/`-V` is intercepted by Composer
 itself — use `composer python use` to see the managed version, or `composer python -c "import sys; print(sys.version)"`.
 
-### PyTorch GPU backends
-
-`composer pip install torch` picks the right PyTorch build for your hardware automatically:
-
-- CUDA for NVIDIA
-- ROCm for AMD
-- Metal for Apple Silicon
-- CPU backend when no GPU is present
-
-To force a specific backend, set the `PYTHON_IN_PHP_TORCH_BACKEND` environment variable (e.g. `cpu`, `cu128`, `rocm7.2`, or `none` to disable the default) or pass `--torch-backend=...` explicitly:
-
-```bash
-PYTHON_IN_PHP_TORCH_BACKEND=cpu composer pip install torch
-```
-
-## Configuration
+## Manual configuration
 
 In addition to the `composer pip` commands you can configure Python-in-PHP manually in `composer.json`:
 
@@ -189,6 +174,21 @@ In addition to the `composer pip` commands you can configure Python-in-PHP manua
 | `packages[].extras` | array | — | Package extras to install (the `name[extra]` pip syntax) |
 | `packages[].index-url` | string | — | Custom PyPI index URL for this package |
 | `packages[].path` | string | — | Absolute path to a local package directory |
+
+### PyTorch GPU backends
+
+`composer pip install torch` picks the right PyTorch build for your hardware automatically:
+
+- CUDA for NVIDIA
+- ROCm for AMD
+- Metal for Apple Silicon
+- CPU backend when no GPU is present
+
+To force a specific backend, set the `PYTHON_IN_PHP_TORCH_BACKEND` environment variable (e.g. `cpu`, `cu128`, `rocm7.2`, or `none` to disable the default) or pass `--torch-backend=...` explicitly:
+
+```bash
+PYTHON_IN_PHP_TORCH_BACKEND=cpu composer pip install torch
+```
 
 ## Using Python objects
 

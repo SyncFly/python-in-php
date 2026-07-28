@@ -103,6 +103,8 @@ class PythonManager
         }
         // With a custom --index-url/path, stored packages are not appended: they would all go through the custom index
 
+        $this->output->displayMessage("Installing packages ⏳");
+
         $result = $this->python_service->executePipCommand($this->project, $command);
 
         $this->output->displayMessage($result['output']);
