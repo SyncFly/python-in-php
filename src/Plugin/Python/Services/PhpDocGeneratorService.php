@@ -18,6 +18,8 @@ class PhpDocGeneratorService
     // Modules inspected per round-trip. Large enough to keep the Python-side worker
     // pool saturated, small enough that the progress counter advances visibly.
     private const PROGRESS_CHUNK_SIZE = 24;
+    // Records what the docs were last generated from, so unchanged packages are skipped.
+    private const STATE_FILE = '.phpdoc-state.json';
 
     private ?PythonBridge $bridge;
     private PythonObject $sys;
@@ -64,10 +66,44 @@ class PhpDocGeneratorService
     {
         $this->preparePython();
 
-        $modules = $this->getModuleNamesByPackages($packages, $include_builtin_modules);
-        $modules = $this->removeExcludedModules($modules);
+        $state = $this->readGenerationState();
+        $python_version = $this->getPythonVersion();
+        // A Python version switch invalidates everything, including the stdlib docs.
+        $same_python = ($state['python-version'] ?? null) === $python_version;
+        $generated_packages = $same_python ? ($state['packages'] ?? []) : [];
 
-        if (empty($modules)) return;
+        $named_packages = array_values(array_filter($packages, fn($package) => $package->name !== null));
+        $modules_by_package = [];
+        foreach ($named_packages as $package) {
+            $modules_by_package[$package->name] = $this->removeExcludedModules($this->bridge->getModuleNamesInPackages([$package->name]));
+        }
+        $this->user_installed_modules = array_merge([], ...array_values($modules_by_package));
+
+        $modules = [];
+        $up_to_date = 0;
+        foreach ($named_packages as $package) {
+            if ($this->isPackageUpToDate($package, $modules_by_package[$package->name], $generated_packages)) {
+                $up_to_date++;
+                continue;
+            }
+            $modules = [...$modules, ...$modules_by_package[$package->name]];
+        }
+
+        $generate_builtins = $include_builtin_modules && !($same_python && !empty($state['builtins']));
+        if ($generate_builtins) {
+            $modules = [...$modules, ...$this->removeExcludedModules([...$this->sys->stdlib_module_names])];
+        }
+
+        // Modules that failed during the previous generation are always retried.
+        $modules = array_values(array_unique([...$modules, ...$this->removeExcludedModules($state['failed_modules'] ?? [])]));
+
+        if ($up_to_date > 0) {
+            $this->output->displayMessage("  ℹ️  $up_to_date packages are already up to date", 1);
+        }
+        if (empty($modules)) {
+            if ($up_to_date > 0) $this->output->displayMessage("  ✅ PHP Docs are up to date");
+            return;
+        }
 
         // Terminate this line with a newline so it flushes to the console *before* the
         // long blocking inspection below. Without the newline the message sits in an
@@ -93,6 +129,59 @@ class PhpDocGeneratorService
         $this->output->displayMessage("  ✅ Done");
 
         $this->reportImportErrors();
+
+        $versions = [];
+        foreach ($named_packages as $package) {
+            if ($package->locked_version !== null) $versions[$package->name] = $package->locked_version;
+        }
+        $this->writeGenerationState([
+            'python-version' => $python_version,
+            'builtins'       => $generate_builtins || ($same_python && !empty($state['builtins'])),
+            'packages'       => [...$generated_packages, ...$versions],
+            'failed_modules' => $this->failedModules(),
+        ]);
+    }
+
+    /** Up to date: the pinned version matches the one the docs were generated for and they still exist. */
+    private function isPackageUpToDate(Package $package, array $modules, array $generated_packages): bool
+    {
+        if ($package->locked_version === null) return false;
+        if (($generated_packages[$package->name] ?? null) !== $package->locked_version) return false;
+        foreach ($modules as $module) {
+            if (!file_exists(implode(DIRECTORY_SEPARATOR, [$this->dir, $this->namespace, $module . '.php']))) return false;
+        }
+        return true;
+    }
+
+    private function getPythonVersion(): string
+    {
+        $info = $this->sys->version_info;
+        return $info[0] . '.' . $info[1];
+    }
+
+    /** Import failures worth retrying on the next run (deliberately skipped modules are not). */
+    private function failedModules(): array
+    {
+        return array_keys(array_filter($this->importErrors, fn($error) => !str_contains($error, 'excluded by pattern')));
+    }
+
+    private function stateFilePath(): string
+    {
+        return implode(DIRECTORY_SEPARATOR, [$this->dir, $this->namespace, self::STATE_FILE]);
+    }
+
+    private function readGenerationState(): array
+    {
+        if (!is_file($this->stateFilePath())) return [];
+        $state = json_decode((string) file_get_contents($this->stateFilePath()), true);
+        return is_array($state) ? $state : [];
+    }
+
+    private function writeGenerationState(array $state): void
+    {
+        $dir = dirname($this->stateFilePath());
+        if (!is_dir($dir)) mkdir($dir, recursive: true);
+        file_put_contents($this->stateFilePath(), json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
     }
 
     /**
@@ -182,6 +271,24 @@ class PhpDocGeneratorService
         if (empty($modules)) return;
 
         $this->deleteForModules($modules);
+        $this->forgetInState($packages, $modules);
+    }
+
+    /** Deleted packages must not count as generated any more. */
+    private function forgetInState(array $packages, array $modules): void
+    {
+        $state = $this->readGenerationState();
+        if ($state === []) return;
+
+        foreach ($packages as $package) {
+            unset($state['packages'][$package->name]);
+        }
+        $roots = array_map(fn($module) => explode('.', $module, 2)[0], $modules);
+        $state['failed_modules'] = array_values(array_filter(
+            $state['failed_modules'] ?? [],
+            fn($module) => !in_array(explode('.', $module, 2)[0], $roots)
+        ));
+        $this->writeGenerationState($state);
     }
 
     private function writeFiles(iterable $php_docs): void

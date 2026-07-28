@@ -92,6 +92,10 @@ class ModuleMock(MagicMock):
         # name must go as a keyword: the first positional Mock argument is spec, which would restrict attributes and break imports like `matplotlib.pyplot.Figure`.
         super().__init__(name=name, **kwargs); self.__name__ = name; self.__file__ = f"__mock__/{name.replace('.', '/')}.py"; self.__path__ = [f"__mock__/{name.replace('.', '/')}",]; loader = importlib.machinery.SourceFileLoader(self.__name__, self.__file__); self.__spec__ = importlib.machinery.ModuleSpec(name=self.__name__, loader=loader, origin=self.__file__)
 
+    def _get_child_mock(self, /, **kwargs):
+        # Children (attributes, call results) are plain MagicMocks: module identity attrs are only needed on the mock in sys.modules, and Mock would instantiate ModuleMock without its required name.
+        return MagicMock(**kwargs)
+
 def _apply_gui_mocks():
     for module_name in GUI_MODULES_TO_MOCK: sys.modules[module_name] = ModuleMock(module_name)
 
