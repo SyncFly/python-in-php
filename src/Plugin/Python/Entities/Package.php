@@ -108,19 +108,21 @@ class Package
         if ($this->locked_version === null || $this->version === null) {
             return true;
         }
-        $constraint = trim($this->version->toString());
-        if ($constraint === '' || $constraint === '*') {
-            return true;
-        }
         // The machine-specific local segment ("+cu126") never takes part in constraint checks
         $pin = explode('+', $this->locked_version)[0];
         if (!class_exists(\Composer\Semver\Semver::class)) {
             return true;
         }
         try {
+            // Checked against the same pip-facing bounds that uv installs by, so the two always agree
+            // (e.g. "^0.4.8" is converted to ">=0.4.8,<1.0.0", which allows 0.5.2)
+            $constraint = $this->version->convertToPip();
+            if ($constraint === '') {
+                return true;
+            }
             return \Composer\Semver\Semver::satisfies($pin, $constraint);
         } catch (\Throwable) {
-            // Constraints composer's parser can't read (e.g. "~=1.2") are trusted as satisfied
+            // Constraints the converter or composer's parser can't read (e.g. "~=1.2") are trusted as satisfied
             return true;
         }
     }

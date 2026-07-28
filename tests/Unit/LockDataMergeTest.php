@@ -75,6 +75,13 @@ test('the local version segment is ignored when checking the constraint', functi
     expect($package->satisfiesConstraint())->toBeTrue();
 });
 
+test('a 0.x caret pin is checked against the pip bounds, not composer caret semantics', function () {
+    // convertToPip("^0.4.8") is ">=0.4.8,<1.0.0", so 0.5.2 is a valid pin and must not be re-resolved
+    expect((new Package('cloakbrowser', new PackageVersion('^0.4.8'), locked_version: '0.5.2'))->satisfiesConstraint())->toBeTrue();
+    expect((new Package('cloakbrowser', new PackageVersion('^0.4.8'), locked_version: '1.0.0'))->satisfiesConstraint())->toBeFalse();
+    expect((new Package('cloakbrowser', new PackageVersion('^0.4.8'), locked_version: '0.4.1'))->satisfiesConstraint())->toBeFalse();
+});
+
 test('wildcard and unparseable constraints trust the pin', function () {
     expect((new Package('a', new PackageVersion('*'), locked_version: '1.0'))->satisfiesConstraint())->toBeTrue();
     expect((new Package('b', new PackageVersion('~=1.2'), locked_version: '9.9'))->satisfiesConstraint())->toBeTrue();
