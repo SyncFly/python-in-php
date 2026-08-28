@@ -16,7 +16,7 @@ The **Python-in-PHP** library allows you to easily use any Python packages as if
 
 </td>
 <td style="max-width: 30%" valign="center">
-<img src="image.png" alt="Python-in-PHP" width="200"/>
+<img src="image.jpg" alt="Python-in-PHP" width="200"/>
 </td>
 </tr>
 </table>
@@ -390,19 +390,14 @@ Symlink creation requires Administrator privileges or Windows Developer Mode. Ru
 
 ## License
 
-This project is distributed under a source-available license.
+This project is licensed under the [Apache License 2.0](./LICENSE).
 
-#### Allowed:
-- Using the package in your projects, including commercial ones ✅
-- Making changes and submitting pull requests to this repository
+You are free to use, modify and distribute it, including in commercial projects,
+provided you retain the copyright notice, state significant changes and include a
+copy of the license. The license also grants an explicit patent license.
 
-#### Prohibited:
-- Creating public forks or distributing the project under your own name
-- Uploading the code (modified or original) anywhere else
+Contributions submitted to this repository are licensed under the same terms.
 
-✅ All contributions are accepted through pull requests to the official repository
-
-#### Attribution:
-- Attribution notice is required for software with publicly available source code
-
-See [LICENSE.md](./LICENSE.md) for full details.
+"SyncFly" and "Python-in-PHP" are trademarks of the project maintainers and are
+not covered by the Apache License; see [TRADEMARKS](./TRADEMARKS) for what use is
+permitted without asking.

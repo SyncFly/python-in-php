@@ -1,0 +1,32 @@
+SyncFly / Python-in-PHP Trademark Policy
+
+"SyncFly", "Python-in-PHP" and the project logos (the "Marks") are trademarks
+of the Python-in-PHP project maintainers.
+
+The Apache License 2.0 that covers the source code of this project does not
+grant any rights to use the Marks (see Section 6 of the License). This document
+describes what is nevertheless permitted.
+
+Permitted without prior permission
+----------------------------------
+
+  * Nominative use: stating truthfully that your software uses, integrates with,
+    is built on or is compatible with SyncFly / Python-in-PHP.
+  * Referring to the project by name in documentation, articles, talks,
+    tutorials and comparisons.
+  * Unmodified redistribution of the project under its own name, as permitted
+    by the Apache License 2.0.
+
+Requires prior written permission
+---------------------------------
+
+  * Using the Marks as the name of a fork or of a modified distribution, or in
+    a way that suggests it is the official project.
+  * Using the Marks in your own product, company, package or domain name, or in
+    a logo, in a way likely to cause confusion about the origin of the software.
+  * Suggesting sponsorship, affiliation or endorsement by the project.
+
+If you distribute a modified version, please give it a distinct name and state
+that it is derived from, but not endorsed by, SyncFly / Python-in-PHP.
+
+Questions and permission requests: https://github.com/syncfly/python-in-php
