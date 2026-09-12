@@ -313,27 +313,12 @@ class PythonBridgeServer:
         return ObjectReference(obj_id, obj_type, is_callable, is_async, methods, is_generator)
 
     def should_return_reference(self, obj: Any) -> bool:
-        """Decide whether to return a reference for an object"""
-        # Return simple types as-is
-        simple_types = (int, float, str, bool, type(None))
+        """Decide whether to return a reference for an object.
 
-        if isinstance(obj, simple_types):
-            return False
-
-        # For small collections of simple types, return as-is
-        if isinstance(obj, (list, tuple)):
-            if len(obj) <= 100 and all(isinstance(item, simple_types) for item in obj):
-                return False
-        elif isinstance(obj, dict):
-            if len(obj) <= 100 and all(isinstance(value, simple_types) for value in obj.values()):
-                return False
-
-        # Always return a reference for spaCy objects
-        if hasattr(obj, '__module__') and str(obj.__module__).startswith('spacy'):
-            return True
-
-        # For other complex objects, return a reference
-        return True
+        Scalars and list/tuple/set/dict are inlined by serialize_for_json before this
+        is consulted, whatever their size or nesting; everything else is a reference.
+        """
+        return not isinstance(obj, (int, float, str, bool, type(None)))
 
     async def handle_client(self, websocket):
         """Handle a client connection"""
@@ -1392,6 +1377,7 @@ class PythonBridgeServer:
             self.host,
             self.port,
             ssl=None,
+            max_size=None,  # local single-client link: the default 1 MiB cap would drop large arrays
             ping_interval=None,
             ping_timeout=3600,
             close_timeout=3600
@@ -1403,24 +1389,25 @@ def main():
     """Entry point"""
     _init_entrypoint_process()
 
-    verbose = "--verbose" in sys.argv
-    logging.basicConfig(
-        level=logging.INFO if verbose else logging.WARNING,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-
     parser = argparse.ArgumentParser(description='Python Bridge WebSocket Server')
     parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
     parser.add_argument('--port', type=int, default=8765, help='Port to bind to')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    parser.add_argument('--verbose', help='Enable logging')
+    parser.add_argument('--log-level', default=None, help='Logging level (DEBUG, INFO, WARNING, ERROR)')
+    parser.add_argument('--debug', action='store_true', help='Shorthand for --log-level DEBUG')
+    parser.add_argument('--verbose', help='Shorthand for --log-level INFO')
 
     args = parser.parse_args()
 
     sys.argv = [sys.argv[0]] #Clear arguments to avoid conflicts in some packages
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    level = args.log_level or ('DEBUG' if args.debug else 'INFO' if args.verbose else 'WARNING')
+    # Everything goes to stderr, which PHP routes to the log file (or /dev/null)
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.WARNING),
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    # PHP probes the port with a bare TCP connect; websockets would log each probe as a failed handshake
+    logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 
     server = PythonBridgeServer(args.host, args.port)
 

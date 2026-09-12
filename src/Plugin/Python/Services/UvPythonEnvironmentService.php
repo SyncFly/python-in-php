@@ -13,17 +13,36 @@ class UvPythonEnvironmentService
 
     public $uv_version = '0.11.29';
 
+    /** uv found on PATH, used only when the download into vendor/bin fails */
+    private ?string $uv_from_path = null;
+
     public function __construct(
         private string $dir,
         private string $bin_dir,
         private OutputService $output
     ){
-        putenv('UV_PYTHON_INSTALL_DIR=' . $this->bin_dir . DIRECTORY_SEPARATOR . 'python');
-        putenv('UV_PYTHON_PREFERENCE=only-managed');
+        // Defaults only: a user-set value (Docker cache mount, system interpreter) wins
+        if (!getenv('UV_PYTHON_INSTALL_DIR')) {
+            putenv('UV_PYTHON_INSTALL_DIR=' . $this->bin_dir . DIRECTORY_SEPARATOR . 'python');
+        }
+        if (!getenv('UV_PYTHON_PREFERENCE')) {
+            putenv('UV_PYTHON_PREFERENCE=only-managed');
+        }
     }
 
     public function installUvIfMissing(): void
     {
+        $external = getenv('UV_BIN');
+        if ($external) {
+            if (!is_file($external)) {
+                throw new \RuntimeException("UV_BIN points to a missing file: $external");
+            }
+            if ($this->isUvOutdated($external)) {
+                $this->output->displayMessage("Warning: UV_BIN uv is older than v{$this->uv_version}; --torch-backend=auto may miss newer GPU backends.");
+            }
+            return;
+        }
+
         $uv_bin = $this->getUvBinPath();
         if (file_exists($uv_bin) && !$this->isUvOutdated($uv_bin)) return;
 
@@ -36,21 +55,31 @@ class UvPythonEnvironmentService
             mkdir($this->bin_dir, 0777, true);
         }
 
-        $this->output->displayMessage("Downloading uv v{$this->uv_version}...");
+        $ok = false;
+        if (!getenv('UV_OFFLINE')) {
+            $this->output->displayMessage("Downloading uv v{$this->uv_version}...");
 
-        set_error_handler(static fn() => true);
-        try {
-            $ok = copy($url, $target);
-        } finally {
-            restore_error_handler();
+            set_error_handler(static fn() => true);
+            try {
+                $ok = copy($url, $target);
+            } finally {
+                restore_error_handler();
+            }
         }
 
         if (!$ok || !file_exists($target)) {
+            // No network (or UV_OFFLINE): fall back to a uv already installed on PATH
+            $this->uv_from_path = $this->findUvOnPath();
+            if ($this->uv_from_path !== null) {
+                $this->output->displayMessage("Could not download uv, using {$this->uv_from_path} from PATH.");
+                return;
+            }
             throw new \RuntimeException(
-                "Failed to download uv from $url.\n" .
+                (getenv('UV_OFFLINE') ? "uv is not installed and UV_OFFLINE is set.\n" : "Failed to download uv from $url.\n") .
                 "Install uv manually, then re-run composer install:\n" .
                 "  macOS/Linux: curl -Ls https://astral.sh/uv/install.sh | sh\n" .
-                "  Windows:     winget install astral-sh.uv"
+                "  Windows:     winget install astral-sh.uv\n" .
+                "and point UV_BIN at the binary or make sure it is on PATH."
             );
         }
 
@@ -93,8 +122,8 @@ class UvPythonEnvironmentService
         $env_path = $this->getEnvDir($python_version);
         $escaped_env_path = escapeshellarg($env_path);
 
-        // Create venv with the required Python version
-        $cmd = "$uv_bin venv --python $python_version $escaped_env_path";
+        // --relocatable keeps the venv's entry points path-independent (Docker multi-stage copies)
+        $cmd = "$uv_bin venv --relocatable --python $python_version $escaped_env_path";
         $this->runCommand($cmd);
 
         // Create a symlink for PythonManager
@@ -132,10 +161,25 @@ class UvPythonEnvironmentService
         );
     }
 
+    /** UV_BIN if set, else the uv downloaded into vendor/bin (or one found on PATH when that failed) */
     public function getUvBinPath(): string
     {
+        $external = getenv('UV_BIN');
+        if ($external) {
+            return $external;
+        }
+        if ($this->uv_from_path !== null) {
+            return $this->uv_from_path;
+        }
         $ext = PHP_OS_FAMILY === 'Windows' ? '.exe' : '';
         return $this->bin_dir . DIRECTORY_SEPARATOR . 'uv' . $ext;
+    }
+
+    private function findUvOnPath(): ?string
+    {
+        $result = $this->runCommand(PHP_OS_FAMILY === 'Windows' ? 'where uv' : 'command -v uv');
+        $path = trim(strtok($result['output'], "\r\n") ?: '');
+        return $result['code'] === 0 && $path !== '' && is_file($path) ? $path : null;
     }
 
     public function getPythonBinPath(): string

@@ -12,6 +12,17 @@ use Python_In_PHP\PythonException;
  */
 class PythonBridge
 {
+    /** Environment variable consulted for each option when it isn't passed explicitly */
+    public const ENV_OPTIONS = [
+        'debug'             => 'PYTHON_IN_PHP_DEBUG',
+        'timeout'           => 'PYTHON_IN_PHP_TIMEOUT',
+        'host'              => 'PYTHON_IN_PHP_HOST',
+        'port'              => 'PYTHON_IN_PHP_PORT',
+        'working_directory' => 'PYTHON_IN_PHP_WORKING_DIRECTORY',
+        'python_binary'     => 'PYTHON_IN_PHP_PYTHON_BINARY',
+        'log_file'          => 'PYTHON_IN_PHP_LOG_FILE',
+    ];
+
     private string $host;
     private int $port;
     private string $wsUri;
@@ -19,10 +30,21 @@ class PythonBridge
     private string $python_script;
     private string $python_binary;
     private bool $debug;
+    private ?string $log_file;
+    private ?\Psr\Log\LoggerInterface $logger;
+    /** Options as passed to the constructor, to detect conflicting startOrGetRunning() calls */
+    private array $options;
 
     private ?Client $client = null;
     private bool $isConnected = false;
     private mixed $process = null;
+    /** Exit status of the worker, cached because proc_get_status() reports it only once */
+    private ?array $worker_exit = null;
+    /** Temp file the worker writes to when a logger is set without a log_file */
+    private ?string $temp_log_file = null;
+    /** @var resource|null read handle on the worker log for forwarding to the logger */
+    private $log_handle = null;
+    private int $log_offset = 0;
     private array $object_references = [];
     /** @var array<string, callable> PHP callables exposed to Python, keyed by callback id */
     private array $php_callbacks = [];
@@ -30,50 +52,97 @@ class PythonBridge
     private array $pipes;
 
     /**
-     * @param array{
-          *     debug?: bool,
-          *     timeout?: int,
-          *     host?: string,
-          *     port?: int,
-          *     working_directory?: string,
-          *     python_binary?: string
-          * } $options
-     */
-    public function __construct(array $options = [])
-    {
-        $this->host = $options['host'] ?? '127.0.0.1';
-        $this->port = $options['port'] ?? $this->getFreePort();
-        $this->wsUri = "ws://{$this->host}:{$this->port}/";
-
-        $this->working_directory = $options['working_directory'] ?? getcwd();
-        $this->python_script = __DIR__ . '/python_server/python_worker.py';
-        $this->python_binary = $options['python_binary'] ?? realpath(__DIR__ . '/../python_bin') . '/python' . (PHP_OS_FAMILY == 'Windows' ? '.exe' : '');
-
-        $this->debug = $options['debug'] ?? false;
-        $this->timeout = $options['timeout'] ?? 36000;
-    }
-
-    public function __destruct()
-    {
-        $this->disconnect();
-        $this->stop();
-    }
-
-    /**
+     * Every option falls back to its PYTHON_IN_PHP_* environment variable (see ENV_OPTIONS),
+     * then to the built-in default.
+     *
      * @param array{
      *     debug?: bool,
      *     timeout?: int,
      *     host?: string,
      *     port?: int,
      *     working_directory?: string,
-     *     python_binary?: string
+     *     python_binary?: string,
+     *     log_file?: string,
+     *     logger?: \Psr\Log\LoggerInterface
      * } $options
+     */
+    public function __construct(array $options = [])
+    {
+        $this->options = $options;
+
+        $this->host = $options['host'] ?? self::env('host') ?? '127.0.0.1';
+        $this->port = (int) ($options['port'] ?? self::env('port') ?? $this->getFreePort());
+        $this->wsUri = "ws://{$this->host}:{$this->port}/";
+
+        $this->working_directory = $options['working_directory'] ?? self::env('working_directory') ?? getcwd();
+        $this->python_script = __DIR__ . '/python_server/python_worker.py';
+        $this->python_binary = $options['python_binary'] ?? self::pythonBinary();
+
+        $this->debug = (bool) ($options['debug'] ?? self::envBool('debug') ?? false);
+        $this->timeout = (int) ($options['timeout'] ?? self::env('timeout') ?? 36000);
+        $this->log_file = $options['log_file'] ?? self::env('log_file');
+        $this->logger = $options['logger'] ?? null;
+    }
+
+    /** Value of an option's environment variable, null when unset or empty */
+    private static function env(string $option): ?string
+    {
+        $value = getenv(self::ENV_OPTIONS[$option]);
+        return ($value === false || $value === '') ? null : $value;
+    }
+
+    private static function envBool(string $option): ?bool
+    {
+        $value = self::env($option);
+        return $value === null ? null : filter_var($value, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /** Interpreter the worker runs on: PYTHON_IN_PHP_PYTHON_BINARY, else the venv installed by Composer */
+    public static function pythonBinary(): string
+    {
+        return self::env('python_binary')
+            ?? realpath(__DIR__ . '/../python_bin') . '/python' . (PHP_OS_FAMILY == 'Windows' ? '.exe' : '');
+    }
+
+    /** Whether the Python environment is installed. Checks the file system only — no process is started. */
+    public static function isInstalled(): bool
+    {
+        return is_executable(self::pythonBinary());
+    }
+
+    public function __destruct()
+    {
+        $this->stop();
+    }
+
+    /**
+     * Returns the shared bridge, creating it on the first call. Options are only applied
+     * when the bridge is created; passing different options later is a programming error
+     * rather than a silent no-op.
+     *
+     * @param array{
+     *     debug?: bool,
+     *     timeout?: int,
+     *     host?: string,
+     *     port?: int,
+     *     working_directory?: string,
+     *     python_binary?: string,
+     *     log_file?: string,
+     *     logger?: \Psr\Log\LoggerInterface
+     * } $options
+     * @throws \LogicException when the bridge already exists with different options
      */
     static function startOrGetRunning(array $options = [])
     {
         global $__python_bridge;
 
         if (isset($__python_bridge)) {
+            if ($options !== [] && $options != $__python_bridge->options) {
+                throw new \LogicException(
+                    'The Python bridge is already running with different options — Py::startIfNotStarted() '
+                    . 'must be called before the first Py:: call, or use environment variables (PYTHON_IN_PHP_*)'
+                );
+            }
             return $__python_bridge;
         }
 
@@ -110,16 +179,49 @@ class PythonBridge
         return false;
     }
 
+    /**
+     * Whether this bridge has a live, responding worker. Never starts one — use start()
+     * or any Py:: call for that.
+     */
     function isRunning(): bool
     {
-        return $this->ping() == 'pong';
+        if (!$this->isConnected) {
+            return false;
+        }
+        try {
+            return $this->ping() == 'pong';
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
-    private function log($message): void
+    /** Start the worker and connect to it (a no-op when already connected). */
+    public function start(): void
     {
+        $this->connectToServer();
+    }
+
+    /** Stop the worker, then start a fresh one. All PythonObject references become stale. */
+    public function restart(): void
+    {
+        $this->stop();
+        $this->connectToServer();
+    }
+
+    private function log($message, string $level = 'debug'): void
+    {
+        if ($this->logger) {
+            $this->logger->log($level, "[python-in-php] $message");
+        }
         if ($this->debug) {
             echo "[DEBUG] " . date('Y-m-d H:i:s') . " - $message\n";
         }
+    }
+
+    /** Path of the file the worker's stdout/stderr are written to, or null */
+    public function getLogFile(): ?string
+    {
+        return $this->log_file ?? $this->temp_log_file;
     }
 
     private function startServer(): void
@@ -127,6 +229,10 @@ class PythonBridge
         if ($this->isStarted()) {
             $this->log("The server is already running on the port {$this->port}");
             return;
+        }
+
+        if (!is_executable($this->python_binary)) {
+            throw new \RuntimeException("Python environment is not installed ({$this->python_binary}) — run `composer install`");
         }
 
         $scriptPath = realpath($this->python_script);
@@ -142,12 +248,10 @@ class PythonBridge
         // die with the launching PHP process. The array form runs Python directly, so
         // $this->process is the Python process itself and stop() can actually kill it.
         // We pass the working directory via proc_open's $cwd argument instead of a
-        // shell `cd`.
-        $args = [$this->python_binary, $scriptPath, '--host', $this->host, '--port', (string) $this->port];
-        if ($this->debug) {
-            $args[] = '--verbose';
-            $args[] = '1';
-        }
+        // shell `cd`. `-u` keeps Python's stdout unbuffered so prints land in the log promptly.
+        $args = [$this->python_binary, '-u', $scriptPath, '--host', $this->host, '--port', (string) $this->port];
+        $args[] = '--log-level';
+        $args[] = $this->debug ? 'INFO' : 'WARNING';
 
         $this->log("Starting the Python server: " . implode(' ', $args));
 
@@ -157,16 +261,26 @@ class PythonBridge
         // forever. That is fatal when a parent reads our stdout to EOF (e.g. the test
         // bootstrap runs `composer install` via passthru()): composer finishes but the
         // inherited pipe never closes, so passthru() — and the whole test run — hangs.
-        // Routing the child's stdio to the null device breaks that inheritance.
+        // Routing the child's stdio to the null device (or a log file) breaks that inheritance.
         $null = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
-        $descriptors = $this->debug
-            ? [] // keep inheriting so the worker's logs are visible while debugging
-            : [
+        $logFile = $this->prepareLogFile();
+        if ($logFile !== null) {
+            $descriptors = [
+                0 => ['file', $null, 'r'],
+                1 => ['file', $logFile, 'a'],
+                2 => ['file', $logFile, 'a'],
+            ];
+        } elseif ($this->debug) {
+            $descriptors = []; // keep inheriting so the worker's logs are visible while debugging
+        } else {
+            $descriptors = [
                 0 => ['file', $null, 'r'],
                 1 => ['file', $null, 'w'],
                 2 => ['file', $null, 'w'],
             ];
+        }
 
+        $this->worker_exit = null;
         $this->process = $process = proc_open($args, $descriptors, $pipes, $this->working_directory);
         if (!is_resource($this->process)) {
             throw new Exception("❌ Failed to start the Python server process");
@@ -175,7 +289,6 @@ class PythonBridge
         $this->pipes = $pipes;
 
         register_shutdown_function(function() {
-            $this->disconnect();
             $this->stop();
         });
 
@@ -184,9 +297,8 @@ class PythonBridge
         $deadline = microtime(true) + $startupTimeout;
 
         while (!$this->isStarted()) {
-            $status = proc_get_status($this->process);
-            if (!$status['running']) {
-                throw new Exception("❌ The Python process exited unexpectedly before the server started");
+            if ($this->workerHasExited()) {
+                $this->throwWorkerCrashed('startup');
             }
 
             if (microtime(true) >= $deadline) {
@@ -201,17 +313,133 @@ class PythonBridge
     }
 
     /**
-     * PID of the spawned Python worker process, or null if no worker is running.
-     * Because the worker is now launched without a shell wrapper, this is the PID of
-     * the Python process itself — the one stop() signals on shutdown.
+     * Decide where the worker's stdout/stderr go: the configured log_file, or a temp file
+     * when a logger is set (so its output can be forwarded), or null for /dev/null.
      */
-    public function getWorkerPid(): ?int
+    private function prepareLogFile(): ?string
+    {
+        if ($this->log_file !== null) {
+            $dir = dirname($this->log_file);
+            if (!is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
+                throw new Exception("❌ Cannot create the worker log directory: $dir");
+            }
+            $file = $this->log_file;
+        } elseif ($this->logger) {
+            $file = $this->temp_log_file = tempnam(sys_get_temp_dir(), 'python-in-php-');
+        } else {
+            return null;
+        }
+
+        if ($this->logger) {
+            $this->log_handle = fopen($file, 'r');
+            $this->log_offset = filesize($file) ?: 0;
+        }
+
+        return $file;
+    }
+
+    /** Forward any new worker log lines to the PSR logger (no-op without a logger). */
+    private function forwardWorkerLog(): void
+    {
+        if (!is_resource($this->log_handle)) {
+            return;
+        }
+        fseek($this->log_handle, $this->log_offset);
+        $chunk = stream_get_contents($this->log_handle);
+        if ($chunk === false || $chunk === '') {
+            return;
+        }
+        $this->log_offset += strlen($chunk);
+
+        $level = 'info';
+        foreach (preg_split('/\r?\n/', rtrim($chunk, "\r\n")) as $line) {
+            if ($line === '') {
+                continue;
+            }
+            // Python writes plain text, so the level is a best-effort guess from the wording;
+            // indented lines (traceback frames) keep the level of the line that opened them
+            if (!preg_match('/^\s/', $line)) {
+                $level = match (true) {
+                    (bool) preg_match('/traceback|error|exception|critical|fatal/i', $line) => 'error',
+                    (bool) preg_match('/warn/i', $line) => 'warning',
+                    default => 'info',
+                };
+            }
+            $this->logger->log($level, "[python] $line");
+        }
+    }
+
+    /** Last lines of the worker log, for crash reports */
+    private function readLogTail(int $lines = 40): string
+    {
+        $file = $this->getLogFile();
+        if ($file === null || !is_file($file)) {
+            return '';
+        }
+        $content = (string) file_get_contents($file, false, null, max(0, filesize($file) - 64 * 1024));
+        $all = preg_split('/\r?\n/', rtrim($content, "\r\n"));
+        return implode("\n", array_slice($all, -$lines));
+    }
+
+    /**
+     * Status of the worker process, or null when none was spawned by this bridge.
+     * proc_get_status() reports the exit code only on the first call after the process
+     * ends, so the terminal status is cached.
+     */
+    private function workerStatus(): ?array
     {
         if (!is_resource($this->process)) {
             return null;
         }
+        if ($this->worker_exit !== null) {
+            return $this->worker_exit;
+        }
         $status = proc_get_status($this->process);
-        return $status['running'] ? $status['pid'] : null;
+        if (!$status['running']) {
+            $this->worker_exit = $status;
+        }
+        return $status;
+    }
+
+    /** True only for a worker this bridge spawned that is no longer running */
+    private function workerHasExited(): bool
+    {
+        $status = $this->workerStatus();
+        return $status !== null && !$status['running'];
+    }
+
+    /**
+     * Report a dead worker: collect its exit status and log tail, tear down the session
+     * so the next call starts a fresh worker, and throw.
+     *
+     * @throws WorkerCrashedException always
+     */
+    private function throwWorkerCrashed(string $command, ?\Throwable $previous = null): never
+    {
+        $status = $this->workerStatus();
+        $signaled = $status !== null && ($status['signaled'] ?? false);
+        $exitCode = $status !== null && !$signaled && $status['exitcode'] >= 0 ? $status['exitcode'] : null;
+        $signal = $signaled ? ($status['termsig'] ?? null) : null;
+
+        $this->forwardWorkerLog();
+        $tail = $this->readLogTail();
+        $logFile = $this->getLogFile();
+
+        $this->log("Python worker exited unexpectedly while executing '$command'", 'error');
+        $this->stop();
+
+        throw new WorkerCrashedException($command, $exitCode, $signal, $logFile, $tail, $previous);
+    }
+
+    /**
+     * PID of the spawned Python worker process, or null if no worker is running.
+     * Because the worker is launched without a shell wrapper, this is the PID of
+     * the Python process itself — the one stop() signals on shutdown.
+     */
+    public function getWorkerPid(): ?int
+    {
+        $status = $this->workerStatus();
+        return $status !== null && $status['running'] ? $status['pid'] : null;
     }
 
     private function getFreePort(): int {
@@ -237,6 +465,7 @@ class PythonBridge
         try {
             $this->client = new Client($this->wsUri, [
                 'timeout' => $this->timeout,
+                'fragment_size' => 1 << 20, // the 4 KB default means thousands of frames per large array
             ]);
             $this->isConnected = true;
         }
@@ -247,9 +476,27 @@ class PythonBridge
         $this->log("✅ The connection established");
     }
 
-    private function stop()
+    /**
+     * Disconnect and terminate the worker. Safe to call repeatedly; the next Py:: call
+     * starts a fresh worker. Objects obtained from the old worker become stale.
+     */
+    public function stop(): void
     {
+        $this->disconnect();
+
+        // Dropping the references lets stale PythonObjects be collected; their
+        // destructors skip the wire because the ids are no longer tracked.
+        $this->object_references = [];
+        $this->php_callbacks = [];
+
+        if (is_resource($this->log_handle)) {
+            $this->forwardWorkerLog();
+            fclose($this->log_handle);
+            $this->log_handle = null;
+        }
+
         if (!is_resource($this->process)) {
+            $this->removeTempLogFile();
             return;
         }
 
@@ -292,6 +539,16 @@ class PythonBridge
 
         proc_close($this->process);
         $this->process = null;
+        $this->worker_exit = null;
+        $this->removeTempLogFile();
+    }
+
+    private function removeTempLogFile(): void
+    {
+        if ($this->temp_log_file !== null && is_file($this->temp_log_file)) {
+            unlink($this->temp_log_file);
+        }
+        $this->temp_log_file = null;
     }
 
     private function processResult($result)
@@ -392,8 +649,9 @@ class PythonBridge
     /**
      * Execute a command on the Python server.
      *
-     * @throws PythonException   when Python raises an exception
-     * @throws \RuntimeException when the connection is lost and cannot be re-established
+     * @throws PythonException        when Python raises an exception
+     * @throws WorkerCrashedException when the worker process died during the command
+     * @throws \RuntimeException      when the connection is lost and cannot be re-established
      */
     public function execute(string $command, array $args = [], ?string $module = null): mixed
     {
@@ -412,17 +670,24 @@ class PythonBridge
 
         try {
             $this->client->send($payload);
-            $response = $this->client->receive();
+            $response = $this->receiveFrame($command);
+        } catch (WorkerCrashedException $e) {
+            throw $e;
         } catch (\Exception $e) {
-            // Connection dropped — try once to reconnect and replay the request.
-            // Only the initial send/receive is retried; a drop mid callback exchange propagates.
-            $this->log("Connection lost ({$e->getMessage()}), attempting reconnect…");
+            // The socket dropped but the worker is alive (or isn't ours) — try once to
+            // reconnect and replay the request. A worker that died is reported by
+            // receiveFrame() instead, since replaying against a fresh process would only
+            // fail on stale object ids. Only the initial send/receive is retried; a drop
+            // mid callback exchange propagates.
+            $this->log("Connection lost ({$e->getMessage()}), attempting reconnect…", 'warning');
             $this->isConnected = false;
             $this->client = null;
             try {
                 $this->connectToServer();
                 $this->client->send($payload);
-                $response = $this->client->receive();
+                $response = $this->receiveFrame($command);
+            } catch (WorkerCrashedException $reconnectEx) {
+                throw $reconnectEx;
             } catch (\Exception $reconnectEx) {
                 throw new \RuntimeException(
                     "Python server connection lost and reconnect failed: " . $reconnectEx->getMessage(),
@@ -447,15 +712,17 @@ class PythonBridge
 
             if ($frameCommand === 'invoke_php_callback') {
                 $this->runPhpCallback($frame);
-                $response = $this->client->receive();
+                $response = $this->receiveFrame($command);
                 continue;
             }
 
             if ($frameCommand === 'release_php_callback') {
                 unset($this->php_callbacks[$frame['callback_id'] ?? '']);
-                $response = $this->client->receive();
+                $response = $this->receiveFrame($command);
                 continue;
             }
+
+            $this->forwardWorkerLog();
 
             // Terminal response for our command.
             if (isset($frame['error']) && $frame['error']) {
@@ -469,6 +736,32 @@ class PythonBridge
 
             // Process the result to create object references
             return $this->processResult($frame['result'] ?? null);
+        }
+    }
+
+    /**
+     * Receive one frame; a socket error caused by the worker dying is turned into a
+     * WorkerCrashedException, anything else propagates unchanged.
+     */
+    private function receiveFrame(string $command): string
+    {
+        try {
+            $frame = $this->client->receive();
+            if ($frame === null) {
+                // textalk yields null for a close frame (e.g. 1009 "message too big")
+                $status = $this->client->getCloseStatus();
+                throw new \RuntimeException("Python worker closed the connection" . ($status ? " (close code $status)" : ''));
+            }
+            return $frame;
+        } catch (\Exception $e) {
+            // The exit may be reported a moment after the socket breaks — give it a beat.
+            for ($i = 0; $i < 10 && !$this->workerHasExited() && $this->process !== null; $i++) {
+                usleep(20000);
+            }
+            if ($this->workerHasExited()) {
+                $this->throwWorkerCrashed($command, $e);
+            }
+            throw $e;
         }
     }
 
@@ -546,6 +839,11 @@ class PythonBridge
         }
 
         if (is_array($arg)) {
+            // Only nested arrays and objects can hide something to convert; a flat scalar
+            // array (the bulk-data case) is sent as is instead of a closure call per element
+            if (!array_filter($arg, 'is_array') && !array_filter($arg, 'is_object')) {
+                return $arg;
+            }
             return array_map($this->serializeArg(...), $arg);
         }
 
@@ -623,10 +921,15 @@ class PythonBridge
     }
 
     /**
-     * Release an object from Python memory
+     * Release an object from Python memory. Ids that are no longer tracked (already
+     * released, or from a worker that has since been stopped) are skipped silently
+     * so destructors never restart a worker just to free a stale object.
      */
     public function releaseObject($objId)
     {
+        if (!isset($this->object_references[$objId])) {
+            return null;
+        }
         try {
             $result = $this->execute('release_object', ['obj_id' => $objId]);
             unset($this->object_references[$objId]);

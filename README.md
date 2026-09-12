@@ -190,6 +190,68 @@ To force a specific backend, set the `PYTHON_IN_PHP_TORCH_BACKEND` environment v
 PYTHON_IN_PHP_TORCH_BACKEND=cpu composer pip install torch
 ```
 
+## Runtime configuration
+
+The Python worker is started lazily on the first `Py::` call (or first generated class call).
+To configure it, call `Py::startIfNotStarted()` **before that first call**, or set environment
+variables — every option has one. Passing different options once the bridge exists throws a
+`LogicException` rather than being silently ignored.
+
+```php
+Py::startIfNotStarted([
+    'log_file' => __DIR__ . '/var/log/python.log',
+    'timeout'  => 3600,
+]);
+```
+
+| Option | Environment variable | Default | Description |
+|--------|----------------------|---------|-------------|
+| `log_file` | `PYTHON_IN_PHP_LOG_FILE` | — | File the worker's stdout/stderr are appended to (see [Logging](#logging)) |
+| `logger` | — | — | PSR-3 logger that receives the worker output and bridge events |
+| `debug` | `PYTHON_IN_PHP_DEBUG` | `false` | Echo bridge traffic and let the worker inherit the PHP process's stdio |
+| `timeout` | `PYTHON_IN_PHP_TIMEOUT` | `36000` | Seconds to wait for a single Python call |
+| `python_binary` | `PYTHON_IN_PHP_PYTHON_BINARY` | managed venv | Interpreter used for the worker |
+| `working_directory` | `PYTHON_IN_PHP_WORKING_DIRECTORY` | `getcwd()` | Working directory of the worker |
+| `host` / `port` | `PYTHON_IN_PHP_HOST` / `PYTHON_IN_PHP_PORT` | `127.0.0.1` / free port | Where the worker listens; an already listening server is reused |
+
+### Logging
+
+By default the worker's stdout and stderr are discarded, so library warnings (LightGBM,
+scikit-learn, transformers…), progress bars and `print()` output are lost — as is the reason
+a worker died. Give it a file, or a PSR-3 logger, or both:
+
+```php
+// Everything Python writes to stdout/stderr, appended to this file
+Py::startIfNotStarted(['log_file' => '/var/log/app/python.log']);
+
+// Forwarded line by line to your logger after each call ("[python] …"), with the level
+// guessed from the text: tracebacks/errors → error, warnings → warning, everything else → info
+Py::startIfNotStarted(['logger' => $monolog]);
+```
+
+Python-level exceptions never depend on this — they always arrive as `PythonException`
+with the full traceback. The log matters for everything that is *not* an exception.
+
+### Worker lifecycle
+
+```php
+Py::isInstalled(); // true when the Python environment exists — a file check, no process spawned
+Py::isRunning();   // true when a worker is up and answering — never starts one
+Py::stop();        // terminate the worker; the next Py:: call starts a fresh one
+Py::restart();     // stop + start; every PythonObject obtained so far becomes stale
+```
+
+`Py::isInstalled()` is the hook for test suites that should not require Python:
+
+```php
+if (!Py::isInstalled()) {
+    $this->markTestSkipped('Python environment not installed — run composer install');
+}
+```
+
+The same methods exist on the bridge instance (`Py::bridge()->stop()`, `->getWorkerPid()`,
+`->getLogFile()`). The worker is also terminated when the PHP process exits.
+
 ## Using Python objects
 
 Python objects are returned as `PythonObject` instances that support method calls and attribute access:
@@ -305,6 +367,30 @@ try {
 }
 ```
 
+### Worker crashes
+
+If the worker process itself dies during a call (segfault in a native extension, the OOM
+killer, `sys.exit()` inside library code), the call throws
+`Python_In_PHP\WorkerCrashedException` instead. It carries the exit code or signal and the
+last lines of the worker log when a `log_file` (or `logger`) is configured — without one,
+the message tells you how to enable it. The session is torn down and the next `Py::` call
+starts a fresh worker; `PythonObject`s from the dead worker are stale and must not be reused.
+
+```php
+use Python_In_PHP\WorkerCrashedException;
+
+try {
+    $model->fit($x, $y);
+} catch (WorkerCrashedException $e) {
+    $e->exitCode;   // 137, or null when killed by a signal
+    $e->signal;     // 9, or null
+    $e->logTail;    // last ~40 lines of stdout/stderr
+}
+```
+
+A dropped connection while the worker is still alive (for example the WebSocket `timeout`)
+is retried once; if that fails a `RuntimeException` is thrown.
+
 ## AI model example
 
 ```php
@@ -357,6 +443,48 @@ $output = $pipe($messages, max_new_tokens: 2048);
 $result = end($output[0]['generated_text'])['content'];
 ```
 
+## Docker
+
+`composer install` downloads `uv` (~10 MB), a managed Python (~30 MB) and the packages. All of
+that is driven by `uv`, so its own environment variables work — the library only fills in
+defaults for the ones it needs and never overrides a value you set:
+
+| Variable | Effect |
+|----------|--------|
+| `UV_CACHE_DIR` | Wheel/source cache — mount it as a build cache to skip re-downloading packages |
+| `UV_PYTHON_INSTALL_DIR` | Where managed interpreters go (default `vendor/bin/python-in-php/python`) — mount it too |
+| `UV_PYTHON_PREFERENCE` | Default `only-managed`; set `system` to use the image's own Python (e.g. `python:3.12` base) instead of downloading one |
+| `UV_BIN` | Path to an existing `uv` binary — skips the download entirely |
+| `UV_OFFLINE` | `1` disables all network access; requires `UV_BIN` (or `uv` on `PATH`) and a warm cache |
+
+Typical Dockerfile:
+
+```dockerfile
+FROM php:8.3-cli
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV UV_BIN=/usr/local/bin/uv \
+    UV_CACHE_DIR=/root/.cache/uv \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python
+
+WORKDIR /app
+COPY composer.json composer.lock python-in-php.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/opt/uv-python \
+    composer install --no-dev --no-interaction
+COPY . .
+```
+
+If the image already has a matching Python (`python:3.12` etc.), add `UV_PYTHON_PREFERENCE=system`
+and drop the `/opt/uv-python` mount.
+
+Run the worker with a log file so crashes are diagnosable from the container logs, e.g.
+`PYTHON_IN_PHP_LOG_FILE=/proc/self/fd/2` or a file under a mounted volume.
+
+> ⚠️ The virtual environment records the interpreter it was created from, and the managed
+> interpreter lives in `UV_PYTHON_INSTALL_DIR`. In multi-stage builds copy `vendor/` **to the
+> same path** it was built at and keep `UV_PYTHON_INSTALL_DIR` identical — or run `composer
+> install` in the final stage with the cache mounts above.
+
 ## Troubleshooting
 
 **`uv` download fails / no internet access**
@@ -366,7 +494,14 @@ The library downloads `uv` automatically during `composer install`. If your envi
 - macOS/Linux: `curl -Ls https://astral.sh/uv/install.sh | sh`
 - Windows: `winget install astral-sh.uv`
 
-Then set the `UV_BIN` env variable or ensure `uv` is in your `PATH`.
+Then point the `UV_BIN` environment variable at the binary; if the download fails and `UV_BIN` is
+not set, a `uv` found on `PATH` is used as a fallback. See [Docker](#docker) for caching and
+`UV_OFFLINE`.
+
+**Python warnings, progress bars or prints are missing / a call ends with `WorkerCrashedException`**
+
+The worker's stdout/stderr go to `/dev/null` unless you configure a log: set
+`PYTHON_IN_PHP_LOG_FILE` (or the `log_file` / `logger` options). See [Logging](#logging).
 
 **"Class py\xxx not found"**
 
@@ -375,6 +510,11 @@ PHPDoc stubs are generated in `vendor/syncfly/python-in-php/py/`. Run `composer 
 **"Could not import: …" during stub generation**
 
 Some modules can't be imported while their stubs are generated. Expected cases — optional modules that aren't installed, or platform-only modules on the wrong OS — are hidden; the remaining ones are summarized on a single line. Re-run with `-v` (e.g. `composer install -v`) to see the full error for each module.
+
+**"Python environment is not installed (…/python_bin/python)"**
+
+The managed interpreter is missing: run `composer install` (it creates the venv and the
+`python_bin` symlink). `Py::isInstalled()` returns `false` in this state without starting anything.
 
 **"Python script was not found"**
 

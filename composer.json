@@ -1,7 +1,7 @@
 {
     "name": "syncfly/python-in-php",
     "description": "\"Python-In-PHP\" allows you to use any Python packages directly in PHP, as if they were native PHP classes. This PHP-Python bridge comes with built-in package manager, which is integrated directly into Composer",
-    "version": "0.8.7",
+    "version": "0.8.8",
     "type": "composer-plugin",
     "license": "Apache-2.0",
     "extra": {
@@ -29,6 +29,9 @@
         "composer-plugin-api": "^2.6",
         "nette/php-generator": "^4.2",
         "ext-sockets": "*"
+    },
+    "suggest": {
+        "psr/log": "Pass a PSR-3 logger as the 'logger' bridge option to receive the Python worker's output"
     },
     "autoload": {
         "psr-4": {

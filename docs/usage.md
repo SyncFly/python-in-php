@@ -286,13 +286,38 @@ Types are converted automatically when crossing the PHP↔Python boundary:
 | `str` | `string` | |
 | `bool` | `bool` | |
 | `None` | `null` | |
-| `list` / `tuple` (simple values) | `array` | Sequential |
+| `list` / `tuple` / `set` | `array` | Sequential; nested collections are converted recursively |
 | `dict` (non-empty, string keys only) | `array` | Associative |
 | `dict` (integer keys or empty) | `PythonDict` | See below |
 | `float('inf')` | `INF` | PHP constant |
 | `float('-inf')` | `-INF` | PHP expression |
 | `float('nan')` | `NAN` | PHP constant |
-| Any complex object | `PythonObject` | Accessed via `->` and `[]` |
+| Any other object | `PythonObject` | Accessed via `->` and `[]` |
+
+Collections are always copied to PHP, whatever their size or nesting depth — there is no
+element-count threshold beyond which a list turns into a reference. Elements that are not
+plain values (a numpy array inside a list, a model inside a dict) become `PythonObject`s
+inside the array. Only non-collection objects — numpy arrays, DataFrames, models,
+generators, module objects… — stay in Python and come back as `PythonObject`. To keep a large
+list on the Python side, wrap it there (e.g. return a generator or a numpy array) and pull
+items on demand.
+
+### Large data
+
+Arguments and results cross the bridge as JSON over a local socket, in both directions and
+without a size limit. Losses during normal use are minimal. This is particularly irrelevant given the response time of neural networks.
+However, if you want to transfer a massive dataset to achieve the best possible performance, you can use the following methods:
+
+Budget roughly **2 s and 20 MB per million floats** (JSON encoding and
+decoding are a quarter of that; the rest is walking the elements on both sides); the same
+again for a result coming back via `->tolist()`. That is fine
+for the occasional big call, but a poor fit for datasets:
+
+- Prepare it as Parquet, CSV or `.npy` and
+  load it in the Python side (`pandas::read_parquet(...)`, `numpy::load(...)`), so the data never touches the
+  socket — it usually comes from a database or a file anyway.
+- Keep large results in Python. A numpy array or DataFrame comes back as a `PythonObject`;
+  slice, aggregate or `->head()` it there and copy only what you need.
 
 ### PHP arrays become Python lists or dicts
 
@@ -388,7 +413,9 @@ try {
 ## Python builtins & running code from PHP
 
 The `Py` facade gives you Python's core directly from PHP. It **starts the Python worker
-automatically on first use** — you never need to call `Py::startIfNotStarted()` first.
+automatically on first use** — `Py::startIfNotStarted([...])` is only needed to pass options
+(log file, timeout…), and then it must come before the first call. `Py::isRunning()`,
+`Py::stop()` and `Py::restart()` manage the worker; see the README's *Runtime configuration*.
 
 ```php
 Py::eval('2 ** 10');                 // 1024 — evaluate an expression, return the result

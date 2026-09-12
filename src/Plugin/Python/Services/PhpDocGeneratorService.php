@@ -49,7 +49,8 @@ class PhpDocGeneratorService
     public function preparePython(): void
     {
         if (!isset($this->bridge)) {
-            $this->bridge = PythonBridge::startOrGetRunning([
+            // Reuse a bridge the host process already configured; only a fresh one gets our debug flag
+            $this->bridge = PythonBridge::getInstance() ?? PythonBridge::startOrGetRunning([
                 'debug' => $this->output->isDebug()
             ]);
             $this->sys = $this->bridge->importModule('sys');

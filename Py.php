@@ -28,19 +28,37 @@ class Py
         return new PhpCallback($callable);
     }
 
+    /**
+     * Start the Python worker with the given options (see PythonBridge::__construct()).
+     * Must precede the first Py:: call: once the bridge exists, different options throw.
+     */
     static function startIfNotStarted(array $options = []): void
     {
-        PythonBridge::startOrGetRunning($options);
+        PythonBridge::startOrGetRunning($options)->start();
     }
 
+    /** Whether the Python environment is installed (file-system check only, no process is started). */
+    static function isInstalled(): bool
+    {
+        return PythonBridge::isInstalled();
+    }
+
+    /** Whether a worker is up and responding. Never starts one. */
     static function isRunning(): bool
     {
         return self::instance()?->isRunning() ?? false;
     }
 
-    function stop(): void
+    /** Stop the worker; the next Py:: call starts a fresh one. */
+    static function stop(): void
     {
-        self::instance()?->__destruct();
+        self::instance()?->stop();
+    }
+
+    /** Stop the worker and start a fresh one (all PythonObject references become stale). */
+    static function restart(): void
+    {
+        self::bridge()->restart();
     }
 
     // ===== Python core =====

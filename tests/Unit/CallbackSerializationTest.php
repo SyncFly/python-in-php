@@ -74,3 +74,12 @@ test('scalar arguments pass through unchanged', function () {
 
     expect($out)->toBe([1, 2.5, true, null, 'hello']);
 });
+
+test('a flat scalar array is passed through untouched, nested callables are still caught', function () {
+    $flat = [1, 2.5, 'strlen', null, true, 'k' => 'v'];
+    $out = bridgeSerializeArgs([$flat, [1, [2, fn () => 3]], [[$flat]]]);
+
+    expect($out[0])->toBe($flat)                       // strings that look callable stay data
+        ->and($out[1][1][1]['__php_callable__'])->toBeTrue()
+        ->and($out[2][0][0])->toBe($flat);
+});
