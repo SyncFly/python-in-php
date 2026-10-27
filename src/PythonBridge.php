@@ -3,7 +3,6 @@
 namespace Python_In_PHP;
 
 use Exception;
-use WebSocket\Client;
 use Python_In_PHP\PythonDict;
 use Python_In_PHP\PythonException;
 
@@ -35,7 +34,7 @@ class PythonBridge
     /** Options as passed to the constructor, to detect conflicting startOrGetRunning() calls */
     private array $options;
 
-    private ?Client $client = null;
+    private ?WebSocketTransport $client = null;
     private bool $isConnected = false;
     private mixed $process = null;
     /** Exit status of the worker, cached because proc_get_status() reports it only once */
@@ -443,10 +442,13 @@ class PythonBridge
     }
 
     private function getFreePort(): int {
-        $socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
-        socket_bind($socket, '127.0.0.1', 0); // 0 = OS will choose a free port
-        socket_getsockname($socket, $addr, $port);
-        socket_close($socket);
+        // Port 0 = the OS picks a free one; streams API so ext-sockets isn't required
+        $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        if ($server === false) {
+            throw new \RuntimeException("Cannot allocate a local port for the Python worker: $errstr");
+        }
+        $port = (int) substr(strrchr(stream_socket_get_name($server, false), ':'), 1);
+        fclose($server);
         return $port;
     }
 
@@ -463,10 +465,8 @@ class PythonBridge
         $this->log("Establishing a WebSocket connection to {$this->wsUri}");
 
         try {
-            $this->client = new Client($this->wsUri, [
-                'timeout' => $this->timeout,
-                'fragment_size' => 1 << 20, // the 4 KB default means thousands of frames per large array
-            ]);
+            // 1 MiB frames: the 4 KB default means thousands of frames per large array
+            $this->client = new WebSocketTransport($this->wsUri, $this->timeout, 1 << 20);
             $this->isConnected = true;
         }
         catch (Exception $e) {
@@ -555,7 +555,9 @@ class PythonBridge
     {
         if (is_array($result) && isset($result['__python_ref__'])) {
             $obj = new PythonObject($this, $result);
-            $this->object_references[$result['obj_id']] = $obj;
+            // Only a marker: holding the object itself would keep it alive forever,
+            // so __destruct would never release it on the Python side (memory leak)
+            $this->object_references[$result['obj_id']] = true;
             return $obj;
         }
         elseif (is_array($result) && isset($result['__python_type__'])) {

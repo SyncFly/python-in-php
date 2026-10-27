@@ -211,7 +211,7 @@ Py::startIfNotStarted([
 | `debug` | `PYTHON_IN_PHP_DEBUG` | `false` | Echo bridge traffic and let the worker inherit the PHP process's stdio |
 | `timeout` | `PYTHON_IN_PHP_TIMEOUT` | `36000` | Seconds to wait for a single Python call |
 | `python_binary` | `PYTHON_IN_PHP_PYTHON_BINARY` | managed venv | Interpreter used for the worker |
-| `working_directory` | `PYTHON_IN_PHP_WORKING_DIRECTORY` | `getcwd()` | Working directory of the worker |
+| `working_directory` | `PYTHON_IN_PHP_WORKING_DIRECTORY` | `getcwd()` | Working directory of the worker; also its import root, so the project's own `.py` modules are importable |
 | `host` / `port` | `PYTHON_IN_PHP_HOST` / `PYTHON_IN_PHP_PORT` | `127.0.0.1` / free port | Where the worker listens; an already listening server is reused |
 
 ### Logging
@@ -351,7 +351,8 @@ original caller.
 
 ### Exceptions
 
-Python exceptions are thrown as `Python_In_PHP\PythonException`:
+Python exceptions are thrown as `Python_In_PHP\PythonException` — from function calls, method
+calls, attribute reads, `[]` access and callable objects alike, always with the traceback:
 
 ```php
 <?php

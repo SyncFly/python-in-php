@@ -53,6 +53,10 @@ use py\datetime\datetime;  // datetime::now(), new datetime(…)
 Submodules map directly to sub-namespaces: `os.path` → `py\os\path`,
 `datetime.datetime` → `py\datetime\datetime`.
 
+Your project's own `.py` files are importable too: the worker's import root is the
+`working_directory` option (the current directory by default), so a `helpers.py` next to your
+`composer.json` is `Py::import('helpers')`.
+
 ---
 
 ## Calling functions

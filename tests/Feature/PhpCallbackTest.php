@@ -27,12 +27,11 @@ test('a PHP callback works as a sorted() key', function () {
 });
 
 test('an exception thrown in a PHP callback propagates to the caller', function () {
-    // PythonObject::__call re-wraps the underlying PythonException as a base
-    // Exception, so we assert on the message the callback failure carries.
+    // The PHP error is raised inside Python and comes back as a PythonException.
     expect(fn () => builtins::list(builtins::map(
         fn ($x) => throw new RuntimeException('boom from php'),
         [1, 2, 3]
-    )))->toThrow(Exception::class, 'boom from php');
+    )))->toThrow(PythonException::class, 'boom from php');
 });
 
 test('a PHP callback may re-enter Python (nested call)', function () {

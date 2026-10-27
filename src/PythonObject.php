@@ -42,12 +42,8 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
     {
         [$args, $kwargs] = $this->classifyArguments($arguments);
 
-        try {
-            return $this->bridge->callMethod($this->objId, $name, $args, $kwargs);
-        }
-        catch (Exception $e) {
-            throw new Exception("Error calling method $name: " . $e->getMessage());
-        }
+        // Errors propagate as-is: PythonException (with traceback) or WorkerCrashedException
+        return $this->bridge->callMethod($this->objId, $name, $args, $kwargs);
     }
 
     /**
@@ -56,11 +52,7 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
     function __get(string $name): mixed
     {
         if (!isset($this->attributes[$name])) {
-            try {
-                $this->attributes[$name] = $this->bridge->getAttribute($this->objId, $name);
-            } catch (Exception $e) {
-                throw new Exception("Error getting attribute $name: " . $e->getMessage());
-            }
+            $this->attributes[$name] = $this->bridge->getAttribute($this->objId, $name);
         }
         return $this->attributes[$name];
     }
@@ -82,8 +74,8 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
         try {
             $this->__get($name);
             return true;
-        } catch (Exception $e) {
-            return false;
+        } catch (PythonException $e) {
+            return false; // only a Python-side miss means "not set"; transport errors propagate
         }
     }
 
@@ -102,11 +94,7 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
             return $this->bridge->asyncCallObject($this->objId, $args, $kwargs);
         }
 
-        try {
-            return $this->bridge->callObject($this->objId, $args, $kwargs);
-        } catch (Exception $e) {
-            throw new Exception("Error calling object: " . $e->getMessage());
-        }
+        return $this->bridge->callObject($this->objId, $args, $kwargs);
     }
 
     /**
@@ -153,7 +141,7 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
         try {
             $this->offsetGet($offset);
             return true;
-        } catch (Exception $e) {
+        } catch (PythonException $e) {
             return false;
         }
     }
@@ -161,11 +149,7 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
     public function offsetGet($offset): mixed
     {
         if (!isset($this->arrayCache[$offset])) {
-            try {
-                $this->arrayCache[$offset] = $this->bridge->callMethod($this->objId, '__getitem__', [$offset]);
-            } catch (Exception $e) {
-                throw new Exception("Error getting item at offset $offset: " . $e->getMessage());
-            }
+            $this->arrayCache[$offset] = $this->bridge->callMethod($this->objId, '__getitem__', [$offset]);
         }
         return $this->arrayCache[$offset];
     }
@@ -190,7 +174,7 @@ class PythonObject implements ArrayAccess, Countable, IteratorAggregate
         try {
             return $this->bridge->callMethod($this->objId, '__len__');
         }
-        catch (Exception $e) {
+        catch (PythonException $e) {
             return $this->bridge->callMethod($this->objId, 'count');
         }
     }

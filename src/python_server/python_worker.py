@@ -1400,6 +1400,9 @@ def main():
 
     sys.argv = [sys.argv[0]] #Clear arguments to avoid conflicts in some packages
 
+    # PHP starts us with cwd = working_directory; make the project's own modules importable, like `python -c`
+    sys.path.insert(0, os.getcwd())
+
     level = args.log_level or ('DEBUG' if args.debug else 'INFO' if args.verbose else 'WARNING')
     # Everything goes to stderr, which PHP routes to the log file (or /dev/null)
     logging.basicConfig(

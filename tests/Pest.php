@@ -53,15 +53,13 @@ function canOpenLocalTcpSocket(): bool
 
     set_error_handler(static fn() => true);
     try {
-        $socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
-        if ($socket === false) {
+        $server = stream_socket_server('tcp://127.0.0.1:0');
+        if ($server === false) {
             return $canOpen = false;
         }
+        fclose($server);
 
-        $canOpen = socket_bind($socket, '127.0.0.1', 0);
-        socket_close($socket);
-
-        return $canOpen;
+        return $canOpen = true;
     } finally {
         restore_error_handler();
     }

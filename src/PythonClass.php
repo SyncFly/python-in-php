@@ -60,8 +60,8 @@ class PythonClass implements ArrayAccess, Countable, IteratorAggregate
                 $new_value = $python_bridge->eval($command)->$name;
                 $php_class::$$name = $new_value;
             }
-            catch (\Exception $e) {
-
+            catch (PythonException $e) {
+                // A class attribute that doesn't exist in Python keeps its PHP default
             }
         }
     }
